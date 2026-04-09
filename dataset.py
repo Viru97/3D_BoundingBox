@@ -69,7 +69,17 @@ class PointCloudInstanceDataset(Dataset):
         rgb_points = img[y_idx, x_idx, ::-1].astype(np.float32) / 255.0  # (P, 3)
         rgb_points = rgb_points.transpose(1, 0)  # (3, P)
 
-        # 3. Standardize Point Count (Subsample or Pad to 1024)
+        # 3. Filter invalid depth points (z <= 0.01) BEFORE sampling and anchor computation
+        valid_depth = pc_points[2] > 0.01
+        if valid_depth.sum() > 10:
+            pc_points = pc_points[:, valid_depth]
+            rgb_points = rgb_points[:, valid_depth]
+
+        # 4. Geometry Centering (Crucial for translation invariance)
+        # Compute anchor on FULL (unsampled) valid point cloud for a stable center
+        anchor = pc_points.mean(axis=1)
+
+        # 5. Standardize Point Count (Subsample or Pad to 1024)
         P = pc_points.shape[1]
         if P >= self.num_points:
             choice = np.random.choice(P, self.num_points, replace=False)
@@ -79,22 +89,13 @@ class PointCloudInstanceDataset(Dataset):
         pc_points = pc_points[:, choice]
         rgb_points = rgb_points[:, choice]
 
-        # 4. Geometry Centering (Crucial for translation invariance)
-        # Find valid points (depth > 0) to compute center
-        depths = np.linalg.norm(pc_points, axis=0)
-        valid_mask = depths > 0.01
-        if valid_mask.sum() > 0:
-            anchor = pc_points[:, valid_mask].mean(axis=1)
-        else:
-            anchor = pc_points.mean(axis=1)
-
         pc_points_centered = pc_points - anchor.reshape(3, 1)
 
         # Calculate target box offsets relative to anchor
         target_box = bboxes[inst_idx]  # (8, 3)
         target_offsets = target_box - anchor.reshape(1, 3)
 
-        # 5. Build final tensor (6, 1024) -> [X,Y,Z, R,G,B]
+        # 6. Build final tensor (6, 1024) -> [X,Y,Z, R,G,B]
         if self.is_train:
             # Data Augmentation: Add tiny jitter to points to prevent overfitting
             pc_points_centered += np.random.randn(*pc_points_centered.shape).astype(np.float32) * 0.002

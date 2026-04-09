@@ -45,9 +45,8 @@ def main(args):
             center_offset, log_dims, rot6d = model(points)
             preds = model.get_3d_box(center_offset, log_dims, rot6d)  # (B, 8, 3)
 
-            # FIX FOR MEAN COLLAPSE: Chamfer Distance Loss
-            # Measures how close the corners are without forcing specific 1:1 order matching
-            dist = torch.cdist(preds, targets)  # Shape: (B, 8, 8) pair-wise distances
+            # Chamfer Distance Loss: order-agnostic corner matching
+            dist = torch.cdist(preds, targets)  # (B, 8, 8)
             loss = dist.min(dim=2)[0].mean() + dist.min(dim=1)[0].mean()
 
             loss.backward()

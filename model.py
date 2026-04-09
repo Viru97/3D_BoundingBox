@@ -52,7 +52,7 @@ class PointNetBBox(nn.Module):
         x = self.relu(self.bn5(self.fc2(x)))
 
         center_offset = self.fc_center(x)
-        log_dims = self.fc_dims(x)  # Log space forces strictly positive dimensions
+        log_dims = torch.clamp(self.fc_dims(x), min=-4.0, max=4.0)  # Keeps dims in [~0.009m, ~27m]
         rot6d = self.fc_rot(x)
 
         return center_offset, log_dims, rot6d

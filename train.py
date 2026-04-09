@@ -1,90 +1,124 @@
-#!/usr/bin/env python3
-"""Training entry point."""
-
 import argparse
-import os
-import random
-import numpy as np
 import torch
+import torch.nn.functional as F
+import numpy as np
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
-from config import Config
-from dataset import build_splits, build_dataloader
-from model import CenterNet3D
-from engine import Trainer
-
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_root",   type=str, default="./dl_challenge")
-    p.add_argument("--output_dir",  type=str, default="./output")
-    p.add_argument("--backbone",    type=str, default="resnet18")
-    p.add_argument("--epochs",      type=int, default=200)
-    p.add_argument("--batch_size",  type=int, default=8)
-    p.add_argument("--lr",          type=float, default=5e-4)
-    p.add_argument("--input_h",     type=int, default=480)
-    p.add_argument("--input_w",     type=int, default=640)
-    p.add_argument("--no_amp",      action="store_true")
-    p.add_argument("--resume",      type=str, default=None)
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--seed",        type=int, default=42)
-    return p.parse_args()
+from dataset import RGBD3DDataset
+from model import RGBDDetector3D
 
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def focal_loss(pred, target):
+    pos_inds = target.eq(1).float()
+    neg_inds = target.lt(1).float()
+
+    neg_weights = torch.pow(1 - target, 4)
+    pred = torch.clamp(pred, 1e-4, 1 - 1e-4)
+
+    pos_loss = torch.log(pred) * torch.pow(1 - pred, 2) * pos_inds
+    neg_loss = torch.log(1 - pred) * torch.pow(pred, 2) * neg_weights * neg_inds
+
+    # Safely clamp num_pos to prevent NaNs if a batch happens to have 0 objects
+    num_pos = torch.clamp(pos_inds.float().sum(), min=1.0)
+    return -(pos_loss.sum() + neg_loss.sum()) / num_pos
 
 
-def main():
-    args = parse_args()
-    set_seed(args.seed)
+def main(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-    cfg = Config(
-        data_root=args.data_root, output_dir=args.output_dir,
-        backbone=args.backbone, max_epochs=args.epochs,
-        batch_size=args.batch_size, lr=args.lr,
-        input_height=args.input_h, input_width=args.input_w,
-        use_amp=not args.no_amp, num_workers=args.num_workers,
-    )
-    os.makedirs(cfg.output_dir, exist_ok=True)
+    dataset_train = RGBD3DDataset(args.data_root, input_size=(512, 512), is_train=True)
+    dataset_val = RGBD3DDataset(args.data_root, input_size=(512, 512), is_train=False)
 
-    print(f"\n{'='*65}")
-    print(f"  CenterNet3D — 3D BBox Prediction (v2 - edge vectors)")
-    print(f"{'='*65}")
-    print(f"  Data       : {cfg.data_root}")
-    print(f"  Input      : {cfg.in_channels}ch × {cfg.input_height}×{cfg.input_width}")
-    print(f"  Backbone   : {cfg.backbone}")
-    print(f"  Batch/Epoch: {cfg.batch_size} / {cfg.max_epochs}")
-    print(f"  LR         : {cfg.lr} (warmup {cfg.warmup_epochs}ep)")
-    print(f"  AMP        : {cfg.use_amp}")
-    print(f"  Heads      : heatmap(1) + offset(2) + center(3) + edges(9)")
-    print(f"{'='*65}\n")
+    dataset_size = len(dataset_train)
+    indices = list(range(dataset_size))
+    np.random.shuffle(indices)
+    split = int(np.floor(0.2 * dataset_size))
+    train_indices, val_indices = indices[split:], indices[:split]
 
-    train_ids, val_ids = build_splits(cfg)
-    print(f"Split: {len(train_ids)} train, {len(val_ids)} val")
+    train_loader = DataLoader(dataset_train, batch_size=args.batch_size,
+                              sampler=torch.utils.data.SubsetRandomSampler(train_indices), num_workers=4)
+    val_loader = DataLoader(dataset_val, batch_size=args.batch_size,
+                            sampler=torch.utils.data.SubsetRandomSampler(val_indices), num_workers=4)
 
-    train_loader = build_dataloader(cfg, train_ids, augment=True, shuffle=True)
-    val_loader   = build_dataloader(cfg, val_ids, augment=False, shuffle=False)
+    model = RGBDDetector3D().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
 
-    model = CenterNet3D(cfg)
-    print(f"Model: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params")
+    best_val_loss = float('inf')
 
-    if args.resume and os.path.isfile(args.resume):
-        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        print(f"Resumed from {args.resume}")
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0
 
-    trainer = Trainer(model, train_loader, val_loader, cfg)
-    if args.resume and os.path.isfile(args.resume):
-        trainer.optimizer.load_state_dict(ckpt["optim"])
-        trainer.scheduler.load_state_dict(ckpt["sched"])
-        trainer.best_metric = ckpt.get("best_metric", -1)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs} [Train]")
+        for batch in pbar:
+            inputs = batch['input'].to(device)
+            hm_target = batch['heatmap'].to(device)
+            corner_target = batch['corner_map'].to(device)
+            reg_mask = batch['reg_mask'].to(device)
 
-    trainer.fit()
+            optimizer.zero_grad()
+            hm_pred, corner_pred = model(inputs)
+
+            loss_hm = focal_loss(hm_pred, hm_target)
+            mask_expand = reg_mask.expand_as(corner_pred)
+
+            # CRITICAL FIX: Replaced Smooth L1 with strict L1 Loss.
+            # Because metric offset errors are tiny (<1.0m), Smooth L1 squares them, causing vanishing gradients.
+            loss_corner = F.l1_loss(corner_pred * mask_expand, corner_target * mask_expand, reduction='sum')
+            loss_corner = loss_corner / (reg_mask.sum() * 24 + 1e-4)
+
+            total_loss = loss_hm + args.weight_corner * loss_corner
+
+            total_loss.backward()
+            optimizer.step()
+            train_loss += total_loss.item()
+            pbar.set_postfix({'Loss': total_loss.item()})
+
+        model.eval()
+        val_loss, val_mae = 0, 0
+        with torch.no_grad():
+            for batch in val_loader:
+                inputs = batch['input'].to(device)
+                hm_target = batch['heatmap'].to(device)
+                corner_target = batch['corner_map'].to(device)
+                reg_mask = batch['reg_mask'].to(device)
+
+                hm_pred, corner_pred = model(inputs)
+
+                loss_hm = focal_loss(hm_pred, hm_target)
+                mask_expand = reg_mask.expand_as(corner_pred)
+
+                # Use strict L1 Loss in validation too
+                loss_corner = F.l1_loss(corner_pred * mask_expand, corner_target * mask_expand, reduction='sum') / (
+                            reg_mask.sum() * 24 + 1e-4)
+
+                val_loss += (loss_hm + args.weight_corner * loss_corner).item()
+
+                abs_diff = torch.abs(corner_pred * mask_expand - corner_target * mask_expand)
+                val_mae += (abs_diff.sum() / (reg_mask.sum() * 24 + 1e-4)).item()
+
+        val_loss /= len(val_loader)
+        val_mae /= len(val_loader)
+        scheduler.step(val_loss)
+
+        print(
+            f"Epoch {epoch + 1} | Train Loss: {train_loss / len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f}m")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), "best_model.pth")
+            print("-> Model saved!")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_corner", type=float, default=20.0)
+    args = parser.parse_args()
+    main(args)

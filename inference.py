@@ -1,132 +1,168 @@
-#!/usr/bin/env python3
-"""Run inference on a single image or directory of images."""
-
-import argparse
 import os
 import cv2
-import numpy as np
 import torch
-
-from config import Config
-from model import CenterNet3D
-from decode import decode_predictions
-from visualize import visualize_detections, visualize_bev
-
-
-def preprocess(img_bgr, cfg):
-    """Preprocess a single BGR image for inference."""
-    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (cfg.input_width, cfg.input_height))
-    img = img.astype(np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406])
-    std  = np.array([0.229, 0.224, 0.225])
-    img = (img - mean) / std
-    img = img.transpose(2, 0, 1)  # CHW
-    return torch.from_numpy(img).float().unsqueeze(0)
+import argparse
+import numpy as np
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from model import RGBDDetector3D
 
 
-def load_calib(calib_path):
-    """Load KITTI calibration file."""
-    data = {}
-    with open(calib_path) as f:
-        for line in f:
-            if ":" not in line:
-                continue
-            k, v = line.split(":", 1)
-            data[k.strip()] = np.array([float(x) for x in v.strip().split()])
-    return data["P2"].reshape(3, 4).astype(np.float32)
+def rigidify_box(corners):
+    """
+    Takes 8 independently regressed corners and forces them into a perfect
+    rigid orthogonal 3D bounding box (cuboid) using vector projection.
+    """
+    # 1. Find the central anchor of the messy points
+    center = corners.mean(axis=0)
+
+    # 2. Approximate the 3 local axes from the noisy corners
+    # X-axis direction
+    axis1 = (corners[1] + corners[2] + corners[5] + corners[6]) - \
+            (corners[0] + corners[3] + corners[4] + corners[7])
+    # Y-axis direction
+    axis2 = (corners[3] + corners[2] + corners[7] + corners[6]) - \
+            (corners[0] + corners[1] + corners[4] + corners[5])
+
+    # 3. Gram-Schmidt orthogonalization (Force exactly 90 degree angles)
+    norm1 = np.linalg.norm(axis1)
+    a1 = axis1 / norm1 if norm1 > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+    a2 = axis2 - np.dot(axis2, a1) * a1
+    norm2 = np.linalg.norm(a2)
+    a2 = a2 / norm2 if norm2 > 1e-6 else np.array([0.0, 1.0, 0.0])
+
+    # Z-axis is the cross product of X and Y (guaranteed orthogonal)
+    a3 = np.cross(a1, a2)
+
+    # 4. Project corners onto axes to find average half-extents (width, height, depth)
+    w = np.abs(np.dot(corners - center, a1)).mean()
+    h = np.abs(np.dot(corners - center, a2)).mean()
+    d = np.abs(np.dot(corners - center, a3)).mean()
+
+    # 5. Reconstruct the 8 perfect corners of the cuboid
+    new_corners = np.array([
+        center - w * a1 - h * a2 - d * a3,  # 0
+        center + w * a1 - h * a2 - d * a3,  # 1
+        center + w * a1 + h * a2 - d * a3,  # 2
+        center - w * a1 + h * a2 - d * a3,  # 3
+        center - w * a1 - h * a2 + d * a3,  # 4
+        center + w * a1 - h * a2 + d * a3,  # 5
+        center + w * a1 + h * a2 + d * a3,  # 6
+        center - w * a1 + h * a2 + d * a3  # 7
+    ])
+    return new_corners
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--image",      type=str, required=True,
-                        help="Path to image or directory")
-    parser.add_argument("--calib",      type=str, required=True,
-                        help="Path to calib file or directory")
-    parser.add_argument("--output_dir", type=str, default="./output/inference")
-    parser.add_argument("--threshold",  type=float, default=0.3)
-    args = parser.parse_args()
+def extract_predictions(heatmap, corner_map, pc_input, conf_thresh=0.15, top_k=15):
+    hmax = F.max_pool2d(heatmap, kernel_size=3, padding=1, stride=1)
+    keep = (hmax == heatmap).float()
+    heatmap = heatmap * keep
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    heatmap = heatmap[0, 0].cpu().numpy()
+    corner_map = corner_map[0].cpu().numpy()
+    pc_input = pc_input[0].cpu()  # (3, 512, 512)
 
-    # Load model
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg  = ckpt.get("cfg", Config())
-    cfg.score_thresh = args.threshold
+    ys, xs = np.where(heatmap > conf_thresh)
+    scores = heatmap[ys, xs]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CenterNet3D(cfg)
-    model.load_state_dict(ckpt["model"])
-    model.to(device).eval()
+    predictions = []
+    for i in range(len(ys)):
+        x, y = xs[i], ys[i]
 
-    # Gather image paths
-    if os.path.isdir(args.image):
-        img_paths = sorted([
-            os.path.join(args.image, f)
-            for f in os.listdir(args.image)
-            if f.endswith(('.png', '.jpg', '.jpeg'))
-        ])
-    else:
-        img_paths = [args.image]
+        # 1. The network predicts relative OFFSETS (shape & size of the box)
+        offset_3d = corner_map[:, y, x].reshape(8, 3)
 
-    print(f"Running inference on {len(img_paths)} images...")
+        # 2. Grab the physical anchor point from the input Point Cloud
+        in_x, in_y = int(x * 4), int(y * 4)
 
-    for img_path in img_paths:
-        name = os.path.splitext(os.path.basename(img_path))[0]
+        # Use a 5x5 patch around the center to find the stable 3D coordinate
+        pc_patch = pc_input[:, max(0, in_y - 2):min(512, in_y + 3), max(0, in_x - 2):min(512, in_x + 3)]
+        patch_flat = pc_patch.reshape(3, -1)
 
-        # Load & preprocess image
-        img_bgr = cv2.imread(img_path)
-        if img_bgr is None:
-            print(f"  Skipping {img_path}")
-            continue
-        img_tensor = preprocess(img_bgr, cfg).to(device)
+        # Just safely grab the exact mean of the point cloud surface patch.
+        center_3d = patch_flat.mean(dim=1).numpy()
 
-        # Load calibration
-        if os.path.isdir(args.calib):
-            calib_path = os.path.join(args.calib, f"{name}.txt")
-        else:
-            calib_path = args.calib
-        P2 = load_calib(calib_path)
+        # 3. Add offsets back to physical anchor to get final bounding box
+        corners_3d = offset_3d + center_3d.reshape(1, 3)
 
-        # Scale calibration
-        orig_h, orig_w = img_bgr.shape[:2]
-        P2_scaled = P2.copy()
-        P2_scaled[0, :] *= cfg.input_width  / orig_w
-        P2_scaled[1, :] *= cfg.input_height / orig_h
-        calib_t = torch.from_numpy(P2_scaled).unsqueeze(0).to(device)
+        # 4. Force the messy points into a rigid, perfect cuboid
+        corners_3d = rigidify_box(corners_3d)
 
-        # Inference
-        with torch.no_grad():
-            output = model(img_tensor)
-            dets = decode_predictions(output, calib_t, cfg)[0]
+        predictions.append({
+            'score': float(scores[i]),
+            'corners_3d': corners_3d
+        })
 
-        n_det = len(dets["scores"])
-        print(f"  {name}: {n_det} detections")
+    predictions = sorted(predictions, key=lambda k: k['score'], reverse=True)
+    return predictions[:top_k]
 
-        # Visualize
-        img_resized = cv2.resize(img_bgr, (cfg.input_width, cfg.input_height))
-        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-        vis = visualize_detections(
-            img_rgb, dets, P2_scaled, cfg.classes, score_thresh=args.threshold
-        )
-        cv2.imwrite(os.path.join(args.output_dir, f"{name}_3d.png"), vis)
 
-        bev = visualize_bev(dets)
-        cv2.imwrite(os.path.join(args.output_dir, f"{name}_bev.png"), bev)
+def draw_3d_box(ax, corners, color='r'):
+    # Standard 8-corner connections
+    lines = [
+        [0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]
+    ]
+    for line in lines:
+        p1, p2 = corners[line[0]], corners[line[1]]
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color=color, linewidth=2)
 
-        # Print detections
-        for i in range(n_det):
-            cls_name = cfg.classes[int(dets["cls_ids"][i])]
-            sc = dets["scores"][i]
-            loc = dets["locs"][i]
-            dims = dets["dims"][i]
-            print(f"    {cls_name} score={sc:.2f}  "
-                  f"xyz=({loc[0]:.1f},{loc[1]:.1f},{loc[2]:.1f})  "
-                  f"hwl=({dims[0]:.2f},{dims[1]:.2f},{dims[2]:.2f})")
 
-    print(f"\n✓ Results saved to {args.output_dir}")
+def main(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = RGBDDetector3D().to(device)
+    if os.path.exists(args.weights):
+        model.load_state_dict(torch.load(args.weights, map_location=device))
+    model.eval()
+
+    img_bgr = cv2.imread(os.path.join(args.sample, "rgb.jpg"))
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    pc = np.load(os.path.join(args.sample, "pc.npy"), allow_pickle=True).astype(np.float32)
+
+    input_size = (512, 512)
+    img_res = cv2.resize(img_rgb, input_size)
+    pc_res = cv2.resize(pc.transpose(1, 2, 0), input_size, interpolation=cv2.INTER_NEAREST).transpose(2, 0, 1)
+
+    img_t = torch.from_numpy(img_res).permute(2, 0, 1)
+    pc_t = torch.from_numpy(pc_res)
+    inputs = torch.cat([img_t, pc_t], dim=0).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        hm_pred, corner_pred = model(inputs)
+
+    # We now pass the Point Cloud input directly into extract_predictions
+    predictions = extract_predictions(hm_pred, corner_pred, pc_input=pc_t.unsqueeze(0), conf_thresh=args.conf_thresh)
+
+    fig = plt.figure(figsize=(15, 6))
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax1.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    ax1.set_title("RGB Input")
+    ax1.axis('off')
+
+    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+    pc_flat = pc.reshape(3, -1)
+    pc_sub = pc_flat[:, np.random.choice(pc_flat.shape[1], size=pc_flat.shape[1] // 100, replace=False)]
+    ax2.scatter(pc_sub[0], pc_sub[1], pc_sub[2], s=0.5, c=pc_sub[2], cmap='viridis', alpha=0.5)
+
+    for idx, pred in enumerate(predictions):
+        draw_3d_box(ax2, pred['corners_3d'], color='red')
+
+    if os.path.exists(os.path.join(args.sample, "bbox3d.npy")):
+        gt_boxes = np.load(os.path.join(args.sample, "bbox3d.npy"), allow_pickle=True)
+        for box in gt_boxes:
+            draw_3d_box(ax2, box, color='green')
+
+    plt.tight_layout()
+    plt.savefig("inference_output.png", dpi=150)
+    print("Saved 'inference_output.png'.")
+    plt.show()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights", type=str, default="best_model.pth")
+    parser.add_argument("--sample", type=str, required=True)
+    parser.add_argument("--conf_thresh", type=float, default=0.15)
+    args = parser.parse_args()
+    main(args)

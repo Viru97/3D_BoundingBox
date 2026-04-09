@@ -1,145 +1,69 @@
-"""CenterNet3D — fixed: dtype mismatch in edges_to_corners."""
-
 import torch
 import torch.nn as nn
-import torchvision.models as models
-from config import Config
+from torchvision.models import resnet34
 
 
-class DeconvNeck(nn.Module):
-    def __init__(self, in_ch, out_ch=256):
-        super().__init__()
-        layers = []
-        ch = in_ch
-        for _ in range(3):
-            layers += [
-                nn.ConvTranspose2d(ch, out_ch, 4, stride=2, padding=1,
-                                   bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            ]
-            ch = out_ch
-        self.net = nn.Sequential(*layers)
-        for m in self.modules():
-            if isinstance(m, nn.ConvTranspose2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+class RGBDDetector3D(nn.Module):
+    """
+    Early-Fusion RGB+Depth Network with Feature Pyramid Decoder.
+    Takes 6-channel input and outputs a heatmap and 3D Bounding Box map.
+    """
 
-    def forward(self, x):
-        return self.net(x)
+    def __init__(self, num_classes=1, num_corners=24):
+        super(RGBDDetector3D, self).__init__()
 
+        # 1. Base Encoder
+        self.backbone = resnet34(pretrained=True)
 
-class Head(nn.Module):
-    def __init__(self, in_ch, mid_ch, out_ch):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, mid_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_ch),
+        # Modify first layer to accept 6 channels (RGB + XYZ Point Cloud)
+        old_conv = self.backbone.conv1
+        self.backbone.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with torch.no_grad():
+            # Copy RGB weights, initialize PC weights symmetrically
+            self.backbone.conv1.weight[:, :3] = old_conv.weight
+            self.backbone.conv1.weight[:, 3:] = old_conv.weight.mean(dim=1, keepdim=True)
+
+        # 2. Decoder (Upsampling with skip connections to restore resolution)
+        # ResNet layer features spatial sizes relative to input (e.g., 512x512):
+        # layer1: /4 (128x128), layer2: /8 (64x64), layer3: /16 (32x32), layer4: /32 (16x16)
+
+        self.up1 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)  # -> /16
+        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)  # -> /8
+        self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)  # -> /4
+
+        # 3. Detection Heads
+        self.heatmap_head = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(mid_ch, out_ch, 1),
+            nn.Conv2d(64, num_classes, kernel_size=1, stride=1, padding=0),
+            nn.Sigmoid()  # Probability map [0, 1]
+        )
+
+        self.corner_head = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, num_corners, kernel_size=1, stride=1, padding=0)  # 24 coordinates
         )
 
     def forward(self, x):
-        return self.net(x)
+        # Encoder
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
 
+        x1 = self.backbone.layer1(x)  # stride 4
+        x2 = self.backbone.layer2(x1)  # stride 8
+        x3 = self.backbone.layer3(x2)  # stride 16
+        x4 = self.backbone.layer4(x3)  # stride 32
 
-# Corner reconstruction signs (8 corners × 3 edges)
+        # Decoder with skip connections
+        u1 = torch.relu(self.up1(x4))
+        u2 = torch.relu(self.up2(u1 + x3))
+        u3 = torch.relu(self.up3(u2 + x2))
 
-CORNER_SIGNS = torch.tensor([
-    [-1, -1, -1],  # c0
-    [+1, -1, -1],  # c1
-    [+1, +1, -1],  # c2
-    [-1, +1, -1],  # c3
-    [-1, -1, +1],  # c4
-    [+1, -1, +1],  # c5
-    [+1, +1, +1],  # c6
-    [-1, +1, +1],  # c7
-], dtype=torch.float32) * 0.5  # (8, 3)
+        # Heads (Output stride is 4)
+        hm = self.heatmap_head(u3)
+        corners = self.corner_head(u3)
 
-
-def edges_to_corners(edges):
-    """Reconstruct 8 corner offsets from 3 edge vectors.
-
-    Args:
-        edges: (..., 9) — [e0_x, e0_y, e0_z, e1_x, ..., e2_z]
-    Returns:
-        corner_offsets: (..., 8, 3)
-    """
-    shape = edges.shape[:-1]
-    e = edges.reshape(*shape, 3, 3)  # (..., 3_edges, 3_coords)
-
-    # FIX: match dtype AND device of input tensor
-    signs = CORNER_SIGNS.to(device=edges.device, dtype=edges.dtype)
-
-    offsets = torch.einsum('kj, ...jd -> ...kd', signs, e)
-    return offsets  # (..., 8, 3)
-
-
-class CenterNet3D(nn.Module):
-    def __init__(self, cfg: Config):
-        super().__init__()
-        self.cfg = cfg
-        nC = cfg.num_classes
-        neck_ch = cfg.neck_channels
-        head_ch = cfg.head_channels
-
-        # ---- Backbone ----
-        bb_map = {
-            "resnet18": (models.resnet18, models.ResNet18_Weights.DEFAULT, 512),
-            "resnet34": (models.resnet34, models.ResNet34_Weights.DEFAULT, 512),
-            "resnet50": (models.resnet50, models.ResNet50_Weights.DEFAULT, 2048),
-        }
-        bb_cls, bb_weights, bb_out = bb_map[cfg.backbone]
-        backbone = bb_cls(weights=bb_weights)
-
-        if cfg.in_channels != 3:
-            old = backbone.conv1
-            backbone.conv1 = nn.Conv2d(
-                cfg.in_channels, old.out_channels,
-                kernel_size=old.kernel_size, stride=old.stride,
-                padding=old.padding, bias=False,
-            )
-            with torch.no_grad():
-                backbone.conv1.weight[:, :3] = old.weight
-                for c in range(3, cfg.in_channels):
-                    backbone.conv1.weight[:, c] = old.weight.mean(dim=1)
-
-        self.stem   = nn.Sequential(backbone.conv1, backbone.bn1,
-                                    backbone.relu, backbone.maxpool)
-        self.layer1 = backbone.layer1
-        self.layer2 = backbone.layer2
-        self.layer3 = backbone.layer3
-        self.layer4 = backbone.layer4
-
-        # ---- Neck ----
-        self.neck = DeconvNeck(bb_out, neck_ch)
-
-        # ---- Heads ----
-        self.hm_head     = Head(neck_ch, head_ch, nC)
-        self.off2d_head  = Head(neck_ch, head_ch, 2)
-        self.center_head = Head(neck_ch, head_ch, 3)
-        self.edge_head   = Head(neck_ch, head_ch, 9)
-
-        self._init_heads()
-
-    def _init_heads(self):
-        self.hm_head.net[-1].bias.data.fill_(-2.19)
-        nn.init.zeros_(self.edge_head.net[-1].weight)
-        nn.init.zeros_(self.edge_head.net[-1].bias)
-
-    def forward(self, x):
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        feat = self.neck(x)
-
-        return {
-            "heatmap":       torch.sigmoid(self.hm_head(feat)),
-            "offset_2d":     self.off2d_head(feat),
-            "center_offset": self.center_head(feat),
-            "edges":         self.edge_head(feat),
-        }
+        return hm, corners

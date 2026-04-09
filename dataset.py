@@ -4,52 +4,40 @@ import numpy as np
 import cv2
 import torch
 from torch.utils.data import Dataset
-import torchvision.transforms as T
 
 
-class RGBD3DDataset(Dataset):
+class PointCloudInstanceDataset(Dataset):
     """
-    Dataset loader for the 3D Detection Challenge.
-    Uses Residual (Offset) Regression for absolute 3D coordinates.
+    Given that we have masks, this dataset extracts individual objects
+    as isolated Point Clouds (N=1024 points) with RGB features.
     """
 
-    def __init__(self, data_root, input_size=(512, 512), down_ratio=4, is_train=True):
+    def __init__(self, data_root, num_points=1024, is_train=True):
         super().__init__()
         self.data_root = data_root
-        self.input_size = input_size
-        self.down_ratio = down_ratio
+        self.num_points = num_points
         self.is_train = is_train
 
-        # Prevent overfitting on small datasets
-        self.color_jitter = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1)
-        self.folders = [f for f in sorted(glob.glob(os.path.join(data_root, "*"))) if os.path.isdir(f)]
+        # Pre-scan dataset to find all individual instances
+        self.instances = []
+        folders = [f for f in sorted(glob.glob(os.path.join(data_root, "*"))) if os.path.isdir(f)]
+
+        print("Scanning dataset for objects...")
+        for folder in folders:
+            bbox_path = os.path.join(folder, "bbox3d.npy")
+            if os.path.exists(bbox_path):
+                bboxes = np.load(bbox_path, allow_pickle=True)
+                n_objects = len(bboxes) if bboxes.ndim >= 2 else 0
+                for inst_idx in range(n_objects):
+                    self.instances.append((folder, inst_idx))
+
+        print(f"Found {len(self.instances)} individual objects.")
 
     def __len__(self):
-        return len(self.folders)
-
-    def draw_gaussian(self, heatmap, center, radius=3):
-        diameter = 2 * radius + 1
-        gaussian = np.zeros((diameter, diameter), dtype=np.float32)
-        for i in range(diameter):
-            for j in range(diameter):
-                dist = np.sqrt((i - radius) ** 2 + (j - radius) ** 2)
-                if dist <= radius:
-                    gaussian[i, j] = np.exp(-0.5 * (dist / (radius / 2)) ** 2)
-
-        y, x = int(center[1]), int(center[0])
-        h, w = heatmap.shape
-
-        left, right = min(x, radius), min(w - x, radius + 1)
-        top, bottom = min(y, radius), min(h - y, radius + 1)
-
-        masked_heatmap = heatmap[y - top:y + bottom, x - left:x + right]
-        masked_gaussian = gaussian[radius - top:radius + bottom, radius - left:radius + right]
-
-        if min(masked_gaussian.shape) > 0 and min(masked_heatmap.shape) > 0:
-            np.maximum(masked_heatmap, masked_gaussian, out=masked_heatmap)
+        return len(self.instances)
 
     def __getitem__(self, idx):
-        folder = self.folders[idx]
+        folder, inst_idx = self.instances[idx]
 
         # 1. Load Data
         img_path = os.path.join(folder, "rgb.jpg")
@@ -57,67 +45,63 @@ class RGBD3DDataset(Dataset):
         mask_path = os.path.join(folder, "mask.npy")
         bbox_path = os.path.join(folder, "bbox3d.npy")
 
-        img = cv2.imread(img_path)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-
-        pc = np.load(pc_path, allow_pickle=True).astype(np.float32)  # (3, H_orig, W_orig)
-        masks = np.load(mask_path, allow_pickle=True)  # (N, H_orig, W_orig)
+        img = cv2.imread(img_path)  # (H, W, 3) BGR
+        pc = np.load(pc_path, allow_pickle=True).astype(np.float32)  # (3, H, W)
+        masks = np.load(mask_path, allow_pickle=True)  # (N, H, W) boolean
         bboxes = np.load(bbox_path, allow_pickle=True).astype(np.float32)  # (N, 8, 3)
 
-        # 2. Resize Inputs
-        orig_h, orig_w = img.shape[:2]
-        img_res = cv2.resize(img, self.input_size)
+        # 2. Extract specific instance
+        mask = masks[inst_idx]
+        y_idx, x_idx = np.where(mask)
 
-        pc_transposed = pc.transpose(1, 2, 0)
-        pc_res = cv2.resize(pc_transposed, self.input_size, interpolation=cv2.INTER_NEAREST)
-        pc_res = pc_res.transpose(2, 0, 1)
+        if len(y_idx) == 0:
+            # Failsafe for empty mask
+            pc_points = np.zeros((3, self.num_points), dtype=np.float32)
+            rgb_points = np.zeros((3, self.num_points), dtype=np.float32)
+            target_corners = np.zeros((24,), dtype=np.float32)
+            return {'points': torch.from_numpy(np.concatenate([pc_points, rgb_points], axis=0)),
+                    'target': torch.from_numpy(target_corners)}
 
-        # 3. Create Target Maps
-        out_h, out_w = self.input_size[0] // self.down_ratio, self.input_size[1] // self.down_ratio
+        # Extract XYZ and RGB
+        pc_points = pc[:, y_idx, x_idx]  # (3, P)
 
-        heatmap = np.zeros((1, out_h, out_w), dtype=np.float32)
-        corner_map = np.zeros((24, out_h, out_w), dtype=np.float32)
-        reg_mask = np.zeros((1, out_h, out_w), dtype=np.float32)
+        # Convert BGR to RGB and normalize
+        rgb_points = img[y_idx, x_idx, ::-1].astype(np.float32) / 255.0  # (P, 3)
+        rgb_points = rgb_points.transpose(1, 0)  # (3, P)
 
-        if masks.ndim == 3:
-            for i in range(len(masks)):
-                m = masks[i]
-                y_idx, x_idx = np.where(m)
-                if len(y_idx) == 0: continue
+        # 3. Standardize Point Count (Subsample or Pad to 1024)
+        P = pc_points.shape[1]
+        if P >= self.num_points:
+            choice = np.random.choice(P, self.num_points, replace=False)
+        else:
+            choice = np.random.choice(P, self.num_points, replace=True)
 
-                # Center for Heatmap placement
-                center_y = np.mean(y_idx) * (out_h / orig_h)
-                center_x = np.mean(x_idx) * (out_w / orig_w)
-                ct_int = [int(center_x), int(center_y)]
-                ct_int[0] = max(0, min(out_w - 1, ct_int[0]))
-                ct_int[1] = max(0, min(out_h - 1, ct_int[1]))
+        pc_points = pc_points[:, choice]
+        rgb_points = rgb_points[:, choice]
 
-                self.draw_gaussian(heatmap[0], ct_int, radius=3)
+        # 4. Geometry Centering (Crucial for translation invariance)
+        # Find valid points (depth > 0) to compute center
+        depths = np.linalg.norm(pc_points, axis=0)
+        valid_mask = depths > 0.01
+        if valid_mask.sum() > 0:
+            anchor = pc_points[:, valid_mask].mean(axis=1)
+        else:
+            anchor = pc_points.mean(axis=1)
 
-                # --- CRITICAL FIX: RESIDUAL TARGETS ---
-                # Calculate the exact physical 3D center of the object using the point cloud mask
-                object_pc = pc[:, m]  # (3, N_points_in_mask)
-                center_3d = np.mean(object_pc, axis=1)  # (3,) absolute anchor point
+        pc_points_centered = pc_points - anchor.reshape(3, 1)
 
-                # Subtract the anchor to create completely translation-invariant offsets
-                corner_offsets = bboxes[i] - center_3d.reshape(1, 3)  # (8, 3) relative coordinates
+        # Calculate target box offsets relative to anchor
+        target_box = bboxes[inst_idx]  # (8, 3)
+        target_offsets = target_box - anchor.reshape(1, 3)
 
-                corner_map[:, ct_int[1], ct_int[0]] = corner_offsets.flatten()
-                reg_mask[0, ct_int[1], ct_int[0]] = 1.0
-
-        # Convert to Tensors
-        img_t = torch.from_numpy(img_res).permute(2, 0, 1)
-        pc_t = torch.from_numpy(pc_res)
-
+        # 5. Build final tensor (6, 1024) -> [X,Y,Z, R,G,B]
         if self.is_train:
-            img_t = self.color_jitter(img_t)
-            pc_t = pc_t + torch.randn_like(pc_t) * 0.002  # noise injection
+            # Data Augmentation: Add tiny jitter to points to prevent overfitting
+            pc_points_centered += np.random.randn(*pc_points_centered.shape).astype(np.float32) * 0.002
 
-        inputs = torch.cat([img_t, pc_t], dim=0)
+        features = np.concatenate([pc_points_centered, rgb_points], axis=0)
 
         return {
-            'input': inputs,
-            'heatmap': torch.from_numpy(heatmap),
-            'corner_map': torch.from_numpy(corner_map),
-            'reg_mask': torch.from_numpy(reg_mask)
+            'points': torch.from_numpy(features),  # (6, 1024)
+            'target': torch.from_numpy(target_offsets.flatten())  # (24,)
         }

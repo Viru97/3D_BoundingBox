@@ -1,69 +1,89 @@
 import torch
 import torch.nn as nn
-from torchvision.models import resnet34
+import torch.nn.functional as F
 
 
-class RGBDDetector3D(nn.Module):
+class PointNetBBox(nn.Module):
     """
-    Early-Fusion RGB+Depth Network with Feature Pyramid Decoder.
-    Takes 6-channel input and outputs a heatmap and 3D Bounding Box map.
+    6D Pose Regression PointNet.
+    Predicts Center, Dimensions, and 6D continuous rotation.
+    Internally constructs a mathematically flawless rigid 3D bounding box.
     """
 
-    def __init__(self, num_classes=1, num_corners=24):
-        super(RGBDDetector3D, self).__init__()
+    def __init__(self, in_channels=6):
+        super().__init__()
 
-        # 1. Base Encoder
-        self.backbone = resnet34(pretrained=True)
+        # Point Feature Extraction
+        self.conv1 = nn.Conv1d(in_channels, 64, kernel_size=1)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=1)
+        self.conv3 = nn.Conv1d(128, 1024, kernel_size=1)
 
-        # Modify first layer to accept 6 channels (RGB + XYZ Point Cloud)
-        old_conv = self.backbone.conv1
-        self.backbone.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        with torch.no_grad():
-            # Copy RGB weights, initialize PC weights symmetrically
-            self.backbone.conv1.weight[:, :3] = old_conv.weight
-            self.backbone.conv1.weight[:, 3:] = old_conv.weight.mean(dim=1, keepdim=True)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
 
-        # 2. Decoder (Upsampling with skip connections to restore resolution)
-        # ResNet layer features spatial sizes relative to input (e.g., 512x512):
-        # layer1: /4 (128x128), layer2: /8 (64x64), layer3: /16 (32x32), layer4: /32 (16x16)
+        # Global Feature Regression
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
 
-        self.up1 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)  # -> /16
-        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)  # -> /8
-        self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)  # -> /4
+        # Split Heads for explicit BBox parametrization
+        self.fc_center = nn.Linear(256, 3)
+        self.fc_dims = nn.Linear(256, 3)
+        self.fc_rot = nn.Linear(256, 6)  # 6D continuous rotation representation
 
-        # 3. Detection Heads
-        self.heatmap_head = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, num_classes, kernel_size=1, stride=1, padding=0),
-            nn.Sigmoid()  # Probability map [0, 1]
-        )
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
 
-        self.corner_head = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, num_corners, kernel_size=1, stride=1, padding=0)  # 24 coordinates
-        )
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=0.3)
 
     def forward(self, x):
-        # Encoder
-        x = self.backbone.conv1(x)
-        x = self.backbone.bn1(x)
-        x = self.backbone.relu(x)
-        x = self.backbone.maxpool(x)
+        # x shape: (Batch, 6, 1024)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.relu(self.bn3(self.conv3(x)))
 
-        x1 = self.backbone.layer1(x)  # stride 4
-        x2 = self.backbone.layer2(x1)  # stride 8
-        x3 = self.backbone.layer3(x2)  # stride 16
-        x4 = self.backbone.layer4(x3)  # stride 32
+        # Global Max Pooling
+        x = torch.max(x, dim=2, keepdim=False)[0]
 
-        # Decoder with skip connections
-        u1 = torch.relu(self.up1(x4))
-        u2 = torch.relu(self.up2(u1 + x3))
-        u3 = torch.relu(self.up3(u2 + x2))
+        # Regression
+        x = self.relu(self.bn4(self.fc1(x)))
+        x = self.dropout(x)
+        x = self.relu(self.bn5(self.fc2(x)))
 
-        # Heads (Output stride is 4)
-        hm = self.heatmap_head(u3)
-        corners = self.corner_head(u3)
+        center_offset = self.fc_center(x)
+        log_dims = self.fc_dims(x)  # Log space forces strictly positive dimensions
+        rot6d = self.fc_rot(x)
 
-        return hm, corners
+        return center_offset, log_dims, rot6d
+
+    def get_3d_box(self, center, log_dims, rot6d):
+        """Deterministically generates the 8 corners of the rotated bounding box."""
+        B = center.shape[0]
+        dims = torch.exp(log_dims) / 2.0  # Half-extents
+
+        # Canonical 8 corners of a unit box centered at origin
+        corners = torch.tensor([
+            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+        ], dtype=torch.float32, device=center.device).unsqueeze(0).repeat(B, 1, 1)
+
+        # Scale to predicted dimensions
+        corners = corners * dims.unsqueeze(1)  # (B, 8, 3)
+
+        # 6D representation to Orthogonal 3x3 Rotation Matrix (Gram-Schmidt)
+        x_raw = rot6d[:, 0:3]
+        y_raw = rot6d[:, 3:6]
+
+        x = F.normalize(x_raw, p=2, dim=1, eps=1e-6)
+        y = y_raw - (x * y_raw).sum(dim=1, keepdim=True) * x
+        y = F.normalize(y, p=2, dim=1, eps=1e-6)
+        z = torch.cross(x, y, dim=1)
+
+        R = torch.stack([x, y, z], dim=-1)  # (Batch, 3, 3)
+
+        # Rotate and apply center translation
+        rotated_corners = torch.bmm(corners, R.transpose(1, 2))
+        final_corners = rotated_corners + center.unsqueeze(1)
+
+        return final_corners

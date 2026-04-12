@@ -21,9 +21,9 @@ def main(args):
     train_indices, val_indices = indices[split:], indices[:split]
 
     train_loader = DataLoader(dataset_train, batch_size=args.batch_size,
-                              sampler=torch.utils.data.SubsetRandomSampler(train_indices), num_workers=4)
+                              sampler=torch.utils.data.SubsetRandomSampler(train_indices), num_workers=8)
     val_loader = DataLoader(dataset_val, batch_size=args.batch_size,
-                            sampler=torch.utils.data.SubsetRandomSampler(val_indices), num_workers=4)
+                            sampler=torch.utils.data.SubsetRandomSampler(val_indices), num_workers=8)
 
     model = PointNetBBox(in_channels=6).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -85,7 +85,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=5e-3)
     args = parser.parse_args()
     main(args)

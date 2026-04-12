@@ -30,7 +30,7 @@ class PointCloudInstanceDataset(Dataset):
                 n_objects = len(bboxes) if bboxes.ndim >= 2 else 0
                 for inst_idx in range(n_objects):
                     self.instances.append((folder, inst_idx))
-
+        print(self.instances)
         print(f"Found {len(self.instances)} individual objects.")
 
     def __len__(self):
@@ -70,7 +70,8 @@ class PointCloudInstanceDataset(Dataset):
         rgb_points = rgb_points.transpose(1, 0)  # (3, P)
 
         # 3. Filter invalid depth points (z <= 0.01) BEFORE sampling and anchor computation
-        valid_depth = pc_points[2] > 0.01
+        valid_depth = (pc_points[2] > 0.1) & (pc_points[2] < 1.5)
+
         if valid_depth.sum() > 10:
             pc_points = pc_points[:, valid_depth]
             rgb_points = rgb_points[:, valid_depth]

@@ -36,130 +36,115 @@ def hungarian_mcd(pred, target):
     return float(np.sqrt(((pred[r]-target[c])**2).sum(-1)).mean())
 
 def box_lwh(corners):
-    v1,v2,v3 = corners[1]-corners[0], corners[3]-corners[0], corners[4]-corners[0]
-    return sorted([np.linalg.norm(v) for v in [v1,v2,v3]], reverse=True)
+    v1, v2, v3 = corners[1]-corners[0], corners[3]-corners[0], corners[4]-corners[0]
+    return sorted([np.linalg.norm(v1), np.linalg.norm(v2), np.linalg.norm(v3)], reverse=True)
 
 
-# ── plotly helper ─────────────────────────────────────────────────────────────
-def add_box(fig, corners, color, name):
+# ── visualisation ─────────────────────────────────────────────────────────────
+def add_plotly_box(fig, corners, color, name):
     xl, yl, zl = [], [], []
     for i, j in EDGES:
         xl += [corners[i,0], corners[j,0], None]
         yl += [corners[i,1], corners[j,1], None]
         zl += [corners[i,2], corners[j,2], None]
-    fig.add_trace(go.Scatter3d(x=xl, y=yl, z=zl, mode='lines',
+    fig.add_trace(go.Scatter3d(x=xl, y=yl, z=zl, mode="lines",
                                line=dict(color=color, width=4), name=name))
 
-def save_failure_html(p_np, t_np, mcd, path):
+def save_html_fig(pred, target, mcd, path):
     fig = go.Figure()
-    add_box(fig, t_np, 'green', 'GT')
-    add_box(fig, p_np, 'red',   'Pred')
-    fig.update_layout(title=f"MCD = {mcd*100:.1f} cm",
-                      scene=dict(aspectmode='data'))
+    add_plotly_box(fig, target, "green", "GT")
+    add_plotly_box(fig, pred,   "red",   "Pred")
+    fig.update_layout(title=f"MCD = {mcd*100:.1f} cm", scene=dict(aspectmode="data"))
     fig.write_html(path)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
+def collate_fn_test(batch):
+    return {
+        "points": torch.stack([b["points"] for b in batch]),
+        "target": torch.stack([b["target"] for b in batch]),
+    }
+
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
 
-    ckpt       = torch.load(args.checkpoint, map_location=device)
-    model_state = {k.replace('_orig_mod.', ''): v
-                   for k, v in ckpt.get("model", ckpt).items()}
+    # FIX: weights_only=False added for PyTorch 2.6+
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
     model = DGCNNBBox(in_channels=ModelConfig.in_channels).to(device)
-    model.load_state_dict(model_state, strict=False)
+    state = {k.replace('_orig_mod.', ''): v for k, v in ckpt.get("model", ckpt).items()}
+    model.load_state_dict(state, strict=False)
     model.eval()
-    print(f"Loaded: {args.checkpoint}  "
-          f"(epoch={ckpt.get('epoch','?')}, "
-          f"best_val_mcd={ckpt.get('best_mcd', float('nan')):.4f}m)")
+    print(f"Loaded: epoch={ckpt.get('epoch','?')} best_mcd={ckpt.get('best_mcd',float('nan')):.4f}m")
 
-    full_ds = PointCloudInstanceDataset(args.data_root,
-                                        num_points=DataConfig.num_points,
-                                        is_train=False)
-    _, _, test_idx = create_splits(len(full_ds), DataConfig.is_train_split,
-                                   DataConfig.val_split, DataConfig.test_split)
+    full_ds = PointCloudInstanceDataset(args.data_root, num_points=DataConfig.num_points, is_train=False)
+    _, _, test_idx = create_splits(len(full_ds), DataConfig.is_train_split, DataConfig.val_split, DataConfig.test_split)
+
     test_ds = Subset(full_ds, test_idx)
-    loader  = DataLoader(test_ds, batch_size=32, shuffle=False,
-                         num_workers=4,
-                         collate_fn=lambda b: {
-                             "points": torch.stack([x["points"] for x in b]),
-                             "target": torch.stack([x["target"] for x in b]),
-                         })
-    print(f"Test instances: {len(test_ds)}")
+    loader  = DataLoader(test_ds, batch_size=16, shuffle=False, num_workers=4, collate_fn=collate_fn_test)
 
     os.makedirs(args.out_dir, exist_ok=True)
-    failures_dir = os.path.join(args.out_dir, "worst_failures")
-    os.makedirs(failures_dir, exist_ok=True)
-
-    all_mcd, all_dim_err, all_z_err = [], [], []
+    all_mcd, all_dim, all_z_center, all_z_height = [], [], [], []
     thresholds = [0.02, 0.05, 0.10, 0.20]
     recalls    = {t: 0 for t in thresholds}
-    records    = []   # (mcd, p_np, t_np)
+    records    = []
 
     with torch.no_grad():
         for batch in loader:
             pts = batch["points"].to(device)
             tgt = batch["target"].to(device).view(-1, 8, 3).float()
-
-            center, log_dims, rot6d = model(pts)
-            pred = model.get_3d_box(center, log_dims, rot6d).float()
+            c, d, r = model(pts)
+            pred = model.get_3d_box(c, d, r).float()
 
             for b in range(pts.shape[0]):
-                p_np = pred[b].cpu().numpy()
-                t_np = tgt[b].cpu().numpy()
-                mcd  = hungarian_mcd(p_np, t_np)
+                p_np, t_np = pred[b].cpu().numpy(), tgt[b].cpu().numpy()
+                mcd = hungarian_mcd(p_np, t_np)
+
                 all_mcd.append(mcd)
                 records.append((mcd, p_np, t_np))
-
                 for τ in thresholds:
                     if mcd < τ: recalls[τ] += 1
 
-                all_dim_err.append(np.abs(np.array(box_lwh(p_np)) -
-                                          np.array(box_lwh(t_np))).mean())
-                all_z_err.append(abs(p_np[:,2].mean() - t_np[:,2].mean()))
-
-    # Save worst failure HTML plots
-    records.sort(key=lambda x: x[0], reverse=True)
-    for i, (mcd, p, t) in enumerate(records[:args.max_vis]):
-        if mcd >= 0.10:
-            save_failure_html(p, t, mcd,
-                os.path.join(failures_dir, f"rank{i+1:02d}_mcd{mcd*100:.1f}cm.html"))
+                p_lwh, t_lwh = box_lwh(p_np), box_lwh(t_np)
+                all_dim.append(np.abs(np.array(p_lwh) - np.array(t_lwh)).mean())
+                all_z_center.append(np.abs(p_np[:,2].mean() - t_np[:,2].mean()))
+                p_zh = p_np[:,2].max() - p_np[:,2].min()
+                t_zh = t_np[:,2].max() - t_np[:,2].min()
+                all_z_height.append(np.abs(p_zh - t_zh))
 
     # ── report ────────────────────────────────────────────────────────────
-    n         = len(all_mcd)
-    mean_mcd  = float(np.mean(all_mcd))
-    med_mcd   = float(np.median(all_mcd))
-    std_mcd   = float(np.std(all_mcd))
-    mean_dim  = float(np.mean(all_dim_err))
-    mean_z    = float(np.mean(all_z_err))
+    n = len(all_mcd)
+    mean_mcd, med_mcd, std_mcd = np.mean(all_mcd), np.median(all_mcd), np.std(all_mcd)
+    mean_dim, mean_z = np.mean(all_dim), np.mean(all_z_center)
 
-    print("\n" + "="*55)
-    print(f"{'TEST RESULTS':^55}")
-    print(f"  Test instances:      {n}")
-    print(f"  Mean MCD:            {mean_mcd*100:.2f} cm")
-    print(f"  Median MCD:          {med_mcd*100:.2f} cm")
-    print(f"  Std MCD:             {std_mcd*100:.2f} cm")
-    print(f"  Mean dim error:      {mean_dim*100:.2f} cm")
-    print(f"  Mean Z-centre err:   {mean_z*100:.2f} cm")
-    print("─"*55)
+    print(f"\n{'='*55}\n{'TEST RESULTS':^55}\n{'='*55}")
+    print(f"Test instances: {n}")
+    print(f"Mean MCD:       {mean_mcd*100:.2f} cm")
+    print(f"Median MCD:     {med_mcd*100:.2f} cm")
+    print(f"Std MCD:        {std_mcd*100:.2f} cm")
+    print(f"{'-'*55}")
     for τ in thresholds:
-        r = recalls[τ]/max(n,1)
-        print(f"  Recall @ {int(τ*100):2d}cm:       {r:.3f}  ({recalls[τ]}/{n})")
-    print("="*55)
+        print(f"Recall @ {int(τ*100)}cm:  {recalls[τ]/max(n,1):.3f}")
+    print(f"{'-'*55}")
+    print(f"Mean dim error: {mean_dim*100:.2f} cm")
+    print(f"Z-Center error: {mean_z*100:.2f} cm  (Z-occlusion impact)")
 
-    # ── metric plots ──────────────────────────────────────────────────────
+    # ── worst cases ───────────────────────────────────────────────────────
+    worst_dir = os.path.join(args.out_dir, "worst_failures")
+    os.makedirs(worst_dir, exist_ok=True)
+    records.sort(key=lambda x: x[0], reverse=True)
+    fails = [r for r in records if r[0] >= 0.10]
+    print(f"\nFound {len(fails)} cases > 10cm error. Exporting top 10 to {worst_dir} ...")
+    for i, (mcd, p_np, t_np) in enumerate(fails[:10]):
+        save_html_fig(p_np, t_np, mcd, os.path.join(worst_dir, f"rank{i+1:02d}_{mcd*100:.1f}cm.html"))
+
+    # ── plots ─────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    fig.suptitle("Test Set Evaluation — DGCNNBBox", fontweight="bold")
-
     ax = axes[0]
     ax.hist(np.array(all_mcd)*100, bins=40, color="#2196F3", edgecolor="white")
-    ax.axvline(mean_mcd*100, color="red",    lw=2, label=f"Mean {mean_mcd*100:.1f} cm")
-    ax.axvline(med_mcd*100,  color="orange", lw=2, label=f"Median {med_mcd*100:.1f} cm")
-    for τ in [2,5,10]: ax.axvline(τ, color="gray", lw=1, ls="--", alpha=0.6)
-    ax.set_xlabel("MCD (cm)"); ax.set_ylabel("Count")
-    ax.set_title("MCD Distribution"); ax.legend()
+    ax.axvline(mean_mcd*100, color="red",    lw=2, label=f"Mean {mean_mcd*100:.1f}cm")
+    ax.axvline(med_mcd*100,  color="orange", lw=2, label=f"Med {med_mcd*100:.1f}cm")
+    ax.set_xlabel("MCD (cm)"); ax.set_title("Distribution"); ax.legend()
 
     ax = axes[1]
     rv = [recalls[t]/max(n,1) for t in thresholds]
@@ -179,21 +164,19 @@ def main(args):
     # ── JSON ──────────────────────────────────────────────────────────────
     summary = {
         "checkpoint": args.checkpoint, "n_test": n,
-        "mean_mcd_m": round(mean_mcd, 5), "median_mcd_m": round(med_mcd, 5),
-        "std_mcd_m": round(std_mcd, 5),   "mean_dim_err_m": round(mean_dim, 5),
-        "mean_z_center_err_m": round(mean_z, 5),
-        "recall": {f"{int(t*100)}cm": round(recalls[t]/max(n,1), 4)
+        "mean_mcd_m": round(float(mean_mcd), 5), "median_mcd_m": round(float(med_mcd), 5),
+        "std_mcd_m": round(float(std_mcd), 5),   "mean_dim_err_m": round(float(mean_dim), 5),
+        "mean_z_center_err_m": round(float(mean_z), 5),
+        "recall": {f"{int(t*100)}cm": round(float(recalls[t]/max(n,1)), 4)
                    for t in thresholds},
     }
     json_path = os.path.join(args.out_dir, "test_results.json")
-    with open(json_path, "w") as f: json.dump(summary, f, indent=2)
-    print(f"JSON summary: {json_path}")
-
+    with open(json_path, "w") as f:
+        json.dump(summary, f, indent=2)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--data_root",  required=True)
     p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     p.add_argument("--out_dir",    default=DEFAULT_OUTPUT_DIR)
-    p.add_argument("--max_vis",    type=int, default=10)
     main(p.parse_args())

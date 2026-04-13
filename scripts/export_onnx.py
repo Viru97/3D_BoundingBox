@@ -31,7 +31,8 @@ def main(args):
     model = DGCNNBBox(in_channels=ModelConfig.in_channels).to(device)
 
     if os.path.exists(args.checkpoint):
-        ckpt = torch.load(args.checkpoint, map_location=device)
+        # FIX: weights_only=False added for PyTorch 2.6+
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         model_state = ckpt.get("model", ckpt)
         # Handle uncompiled model loading into standard or compiled definitions easily
         model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}

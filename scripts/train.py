@@ -4,21 +4,22 @@ import math
 import argparse
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torch.amp import GradScaler, autocast
 from scipy.optimize import linear_sum_assignment
 
-from dataset import PointCloudInstanceDataset
-from model import DGCNNBBox
+from sereact_bbox.dataset import PointCloudInstanceDataset
+from sereact_bbox.model import DGCNNBBox
+from sereact_bbox.validation import create_splits
+from sereact_bbox.loss import AccuracyBoxLoss
+from sereact_bbox.config import TrainConfig, ModelConfig, DataConfig
 
-# SPEED OPTIMIZATION: Enable TF32 for Ampere+ GPUs (Massive matrix multiplication speedup)
-torch.set_float32_matmul_precision('high')
+# RESTORED: Disable TF32 truncation. We need true 32-bit floats for millimeter-precise matrices!
+torch.set_float32_matmul_precision('highest')
 
 
 @torch.no_grad()
 def mean_corner_dist(pred, target):
-    """ Track Evaluation metrics only (No backward pass overhead) """
     pred = pred.float()
     target = target.float()
     B = pred.shape[0]
@@ -44,32 +45,32 @@ def cosine_lr(optimizer, epoch, warmup, total, base_lr, min_lr=1e-6):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} | TF32 Enabled: True")
+    print(f"Device: {device} | TF32 Disabled (Max Precision Mode)")
 
-    full_ds = PointCloudInstanceDataset(args.data_root, num_points=args.num_points, is_train=True)
-    n = len(full_ds)
-    idx = np.random.permutation(n)
-    split = int(0.30 * n)
-    train_idx, val_idx = idx[split:], idx[:split]
+    full_ds = PointCloudInstanceDataset(args.data_root, num_points=DataConfig.num_points, is_train=True)
+    train_idx, val_idx, _ = create_splits(len(full_ds), DataConfig.is_train_split, DataConfig.val_split,
+                                          DataConfig.test_split)
 
-    train_ds = Subset(PointCloudInstanceDataset(args.data_root, args.num_points, is_train=True), train_idx)
-    val_ds = Subset(PointCloudInstanceDataset(args.data_root, args.num_points, is_train=False), val_idx)
+    train_ds = Subset(PointCloudInstanceDataset(args.data_root, DataConfig.num_points, is_train=True), train_idx)
+    val_ds = Subset(PointCloudInstanceDataset(args.data_root, DataConfig.num_points, is_train=False), val_idx)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-                              pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
-                            pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=TrainConfig.batch_size, shuffle=True,
+                              num_workers=TrainConfig.num_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=TrainConfig.batch_size, shuffle=False,
+                            num_workers=TrainConfig.num_workers, pin_memory=True)
 
-    model = DGCNNBBox(in_channels=args.in_channels).to(device)
+    model = DGCNNBBox(in_channels=ModelConfig.in_channels).to(device)
 
     if hasattr(torch, "compile"):
         try:
             print("Optimizing CUDA graph with torch.compile()...")
             model = torch.compile(model)
         except Exception as e:
-            print(f"Skipping torch.compile (Error: {e})")
+            print(f"Skipping torch.compile...")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    criterion = AccuracyBoxLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=TrainConfig.learning_rate,
+                                  weight_decay=TrainConfig.weight_decay)
     scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
 
     os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
@@ -81,8 +82,8 @@ def main(args):
 
     best_mcd = float("inf")
 
-    for epoch in range(args.epochs):
-        lr = cosine_lr(optimizer, epoch, args.warmup, args.epochs, args.lr)
+    for epoch in range(TrainConfig.epochs):
+        lr = cosine_lr(optimizer, epoch, TrainConfig.warmup_epochs, TrainConfig.epochs, TrainConfig.learning_rate)
 
         model.train()
         t_loss = 0.
@@ -90,7 +91,6 @@ def main(args):
 
         for batch in train_loader:
             pts = batch["points"].to(device)
-            anchor = batch["anchor"].to(device)
             tgt = batch["target"].to(device).view(-1, 8, 3)
 
             optimizer.zero_grad(set_to_none=True)
@@ -98,27 +98,16 @@ def main(args):
                 center, log_dims, rot6d = model(pts)
                 pred = model.get_3d_box(center, log_dims, rot6d)
 
-                pred_f = pred.float()
-                tgt_f = tgt.float()
-
-                tgt_centre = tgt_f.mean(dim=1)
-                loss_anchor = F.smooth_l1_loss(center.float(), tgt_centre, beta=0.01)
-
-                # SPEED OPTIMIZATION: 100% GPU Native Loss Calculation.
-                # Bypassing the CPU Hungarian assignment sync saves hundreds of milliseconds per batch.
-                dist = torch.cdist(pred_f, tgt_f)
-                chamfer = dist.min(2)[0].mean() + dist.min(1)[0].mean()
-
-                loss = 2.0 * chamfer + 1.0 * loss_anchor
+                loss = criterion(pred.float(), tgt.float(), center)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), TrainConfig.grad_clip)
             scaler.step(optimizer)
             scaler.update()
 
             t_loss += loss.item()
-            t_mcds.extend(mean_corner_dist(pred_f, tgt_f))
+            t_mcds.extend(mean_corner_dist(pred.float(), tgt.float()))
 
         t_loss /= len(train_loader)
         t_mcd_mean = float(np.mean(t_mcds))
@@ -136,18 +125,16 @@ def main(args):
                 center, log_dims, rot6d = model(pts)
                 pred = model.get_3d_box(center, log_dims, rot6d)
 
-                dist = torch.cdist(pred.float(), tgt.float())
-                chamfer = dist.min(2)[0].mean() + dist.min(1)[0].mean()
+                loss = criterion(pred.float(), tgt.float(), center)
 
-                val_loss_anchor = F.smooth_l1_loss(center.float(), tgt.float().mean(dim=1), beta=0.01)
-                v_loss += (2.0 * chamfer + 1.0 * val_loss_anchor).item()
+                v_loss += loss.item()
                 v_mcds.extend(mean_corner_dist(pred.float(), tgt.float()))
 
         v_loss /= len(val_loader)
         v_mcd_mean = float(np.mean(v_mcds))
         v_mcd_median = float(np.median(v_mcds))
 
-        print(f"Ep {epoch + 1:03d}/{args.epochs}  lr={lr:.2e}  "
+        print(f"Ep {epoch + 1:03d}/{TrainConfig.epochs}  lr={lr:.2e}  "
               f"train: loss={t_loss:.4f} MCD={t_mcd_mean:.4f}m (med={t_mcd_median:.4f}m)  "
               f"val:   loss={v_loss:.4f} MCD={v_mcd_mean:.4f}m (med={v_mcd_median:.4f}m)", flush=True)
 
@@ -161,7 +148,6 @@ def main(args):
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "best_mcd": best_mcd,
-                "args": vars(args),
             }, args.save_path)
             print(f"  ✓ Best MCD {best_mcd:.4f} m — saved to {args.save_path}")
 
@@ -169,12 +155,16 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--data_root", required=True)
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--num_points", type=int, default=2048)
-    p.add_argument("--in_channels", type=int, default=7)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--warmup", type=int, default=5)
-    p.add_argument("--num_workers", type=int, default=16)
     p.add_argument("--save_path", type=str, default="best_model.pth")
-    main(p.parse_args())
+    p.add_argument("--epochs", type=int, default=TrainConfig.epochs, help="Number of training epochs")
+    p.add_argument("--batch_size", type=int, default=TrainConfig.batch_size, help="Batch size for training")
+    p.add_argument("--in_channels", type=int, default=ModelConfig.in_channels, help="Number of input channels")
+
+    args = p.parse_args()
+
+    # Override configs with args if provided
+    TrainConfig.epochs = args.epochs
+    TrainConfig.batch_size = args.batch_size
+    ModelConfig.in_channels = args.in_channels
+
+    main(args)

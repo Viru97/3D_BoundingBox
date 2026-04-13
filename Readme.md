@@ -106,29 +106,36 @@ Z-Occlusion Metrics: Explicit tracking of the Mean Z-Height Error to measure how
 
 5. Getting Started & Execution
 
+The project has been refactored into a standard Python package (`src/sereact_bbox/`) with entry-point scripts stored in `scripts/`. You can run them using the provided `./run.sh` wrapper, or by installing the package in editable mode via `pip install -e .`.
+
 1. Training the DGCNN Model
 
 Trains the model from scratch using the 7-channel Contextual Sampling dataset.
 
-python train.py --data_root /path/to/dataset --epochs 80 --batch_size 16 --in_channels 7
-
+```bash
+./run.sh train.py --data_root /path/to/dataset --epochs 80 --batch_size 16 --in_channels 7
+```
 
 2. Testing & Evaluation
 
 Evaluates the model on the unseen test set, calculates Hungarian MCD, and isolates the worst-performing predictions (errors > 10cm) for failure analysis.
 
-python test.py --data_root /path/to/dataset --checkpoint best_model.pth --vis_dir test_output
-
+```bash
+./run.sh test.py --data_root /path/to/dataset --checkpoint best_model.pth --vis_dir test_output
+```
 
 3. Interactive Visualization (Inference)
 
 Generates fully interactive 3D Plotly HTML files. Open the output files in any web browser to pan, zoom, and rotate around the predicted rigid boxes and raw point clouds.
 
-python inference.py --data_root /path/to/dataset --checkpoint best_model.pth --out_dir output
-
+```bash
+./run.sh inference.py --data_root /path/to/dataset --checkpoint best_model.pth --out_dir output
+```
 
 4. High-Throughput Deployment (ONNX)
 
 Exports the PyTorch graph to a universally deployable FP32 ONNX model (opset 18), ready for TensorRT or ONNXRuntime ingestion.
 
-python export_onnx.py --checkpoint best_model.pth --out_dir onnx_export
+```bash
+./run.sh export_onnx.py --checkpoint best_model.pth --out_dir onnx_export
+```

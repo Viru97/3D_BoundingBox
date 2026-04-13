@@ -8,10 +8,10 @@ from torch.utils.data import Dataset
 class PointCloudInstanceDataset(Dataset):
     """
     Contextual Sampling Dataset (7-Channels: X, Y, Z, R, G, B, Mask)
-    Reverted to lightning-fast Vectorized Random Sampling. DGCNN natively
-    handles edge-detection without needing the massive O(N*K) CPU overhead of FPS.
+    RESTORED: Vectorized Random Sampling. Removes the O(N^2) CPU bottleneck
+    caused by Farthest Point Sampling, keeping the GPU fed at 100%.
     """
-    def __init__(self, data_root, num_points=1024, is_train=True):
+    def __init__(self, data_root, num_points=2048, is_train=True):
         super().__init__()
         self.data_root = data_root
         self.num_points = num_points
@@ -69,7 +69,7 @@ class PointCloudInstanceDataset(Dataset):
 
         N_obj, N_bg = pc_obj.shape[1], pc_bg.shape[1]
 
-        # SPEED OPTIMIZATION: Instant vectorized random choice (Prevents CPU data-starvation)
+        # FAST VECTORIZED RANDOM CHOICE
         if N_obj > 0:
             choice_obj = np.random.choice(N_obj, n_obj_samples, replace=(N_obj < n_obj_samples))
             pc_obj, rgb_obj = pc_obj[:, choice_obj], rgb_obj[:, choice_obj]

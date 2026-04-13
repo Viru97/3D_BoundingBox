@@ -4,10 +4,12 @@ import torch
 import argparse
 import numpy as np
 import plotly.graph_objects as go
-from model import DGCNNBBox
+from sereact_bbox.model import DGCNNBBox
+from sereact_bbox.config import DataConfig, ModelConfig, DEFAULT_OUTPUT_DIR, DEFAULT_CHECKPOINT
 
 EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
          (0, 4), (1, 5), (2, 6), (3, 7)]
+
 
 def add_plotly_box(fig, corners, color, name):
     x_lines, y_lines, z_lines = [], [], []
@@ -18,6 +20,7 @@ def add_plotly_box(fig, corners, color, name):
 
     fig.add_trace(
         go.Scatter3d(x=x_lines, y=y_lines, z=z_lines, mode='lines', line=dict(color=color, width=4), name=name))
+
 
 def run_sample(model, device, sample_dir, out_dir, sample_idx, total, num_points=1024):
     img_bgr = cv2.imread(os.path.join(sample_dir, "rgb.jpg"))
@@ -43,6 +46,8 @@ def run_sample(model, device, sample_dir, out_dir, sample_idx, total, num_points
         pc_bg = pc[:, bg_y, bg_x]
         rgb_bg = img_rgb[bg_y, bg_x].astype(np.float32).T / 255.0
 
+        # RGB already in [0,1] — no further normalisation (matches training)
+
         valid_obj = pc_obj[2] > 0.01
         pc_obj, rgb_obj = pc_obj[:, valid_obj], rgb_obj[:, valid_obj]
 
@@ -54,7 +59,7 @@ def run_sample(model, device, sample_dir, out_dir, sample_idx, total, num_points
 
         N_obj, N_bg = pc_obj.shape[1], pc_bg.shape[1]
 
-        # Reverted Inference to lightning fast random sampling to match dataset.py
+        # Fixed random sampling
         if N_obj > 0:
             c_obj = np.random.choice(N_obj, n_obj, replace=(N_obj < n_obj))
             pc_obj, rgb_obj = pc_obj[:, c_obj], rgb_obj[:, c_obj]
@@ -87,8 +92,8 @@ def run_sample(model, device, sample_dir, out_dir, sample_idx, total, num_points
         corners_abs = pred_corners[0].cpu().numpy() + anchor
         predicted_boxes.append(corners_abs)
 
-        dims = torch.exp(log_dims[0]).cpu().numpy()
-        print(f"  Obj {i + 1}: {dims[0]:.3f}m × {dims[1]:.3f}m × {dims[2]:.3f}m")
+        # dims = torch.exp(log_dims[0]).cpu().numpy()
+        # print(f"  Obj {i + 1}: {dims[0]:.3f}m × {dims[1]:.3f}m × {dims[2]:.3f}m")
 
     fig = go.Figure()
 
@@ -119,6 +124,7 @@ def run_sample(model, device, sample_dir, out_dir, sample_idx, total, num_points
     fig.write_html(out_path)
     print(f"  Saved Interactive 3D Plot: {out_path}")
 
+
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DGCNNBBox(in_channels=args.in_channels).to(device)
@@ -128,8 +134,13 @@ def main(args):
         model_state = ckpt.get("model", ckpt)
         model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}
         model.load_state_dict(model_state, strict=False)
-        print("Loaded DGCNN (7-Channel) weights successfully.")
+
+        # Use saved num_points from checkpoint if available
+        saved_args = ckpt.get("args", {})
+        num_points = args.num_points if args.num_points != 1024 else saved_args.get("num_points", 1024)
+        print(f"Loaded DGCNN (7-Channel) weights successfully.")
     else:
+        num_points = args.num_points
         print("[WARN] Weights not found!")
 
     model.eval()
@@ -140,14 +151,15 @@ def main(args):
         os.path.isdir(p) and os.path.exists(os.path.join(p, "rgb.jpg")))
 
     for idx, sd in enumerate(samples, 1):
-        run_sample(model, device, sd, args.out_dir, idx, len(samples), num_points=args.num_points)
+        run_sample(model, device, sd, args.out_dir, idx, len(samples), num_points=num_points)
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--weights", default="best_model.pth")
-    p.add_argument("--out_dir", default="output")
-    p.add_argument("--num_points", type=int, default=2048)
-    p.add_argument("--in_channels", type=int, default=7)
+    p.add_argument("--weights", default=str(DEFAULT_CHECKPOINT))
+    p.add_argument("--out_dir", default=str(DEFAULT_OUTPUT_DIR))
+    p.add_argument("--num_points", type=int, default=DataConfig.num_points)
+    p.add_argument("--in_channels", type=int, default=ModelConfig.in_channels)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--sample", type=str)
     g.add_argument("--data_root", type=str)

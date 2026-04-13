@@ -1,18 +1,3 @@
-"""
-dataset.py  —  PointCloudInstanceDataset  (v2)
-================================================
-Augmentations added:
-  • Random rotation around gravity (Z) axis           ← most impactful
-  • Random scale jitter (±10 %)
-  • Random axis-aligned reflection (X and Y)
-  • Point dropout  (randomly zero-out up to 10 % of points)
-  • Colour jitter  (brightness / contrast on the RGB channels)
-  • Gaussian point noise (existing, tuned up slightly)
-
-Training-time anchor normalisation is unchanged so the model still
-regresses box corners relative to the point-cloud centroid.
-"""
-
 import os
 import glob
 import numpy as np
@@ -20,42 +5,29 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 
-
-# ── rotation helpers ──────────────────────────────────────────────────────────
-def _rot_z(angle_rad):
-    """3×3 rotation matrix around the Z (gravity) axis."""
-    c, s = np.cos(angle_rad), np.sin(angle_rad)
-    return np.array([[c, -s, 0],
-                     [s,  c, 0],
-                     [0,  0, 1]], dtype=np.float32)
-
-
 class PointCloudInstanceDataset(Dataset):
     """
-    Extracts individual objects as isolated point clouds (N=1024 points)
-    with XYZ + RGB features.  Targets are the 8 GT corners *relative to
-    the point-cloud centroid* so the model is translation-invariant.
+    Contextual Sampling Dataset (7-Channels: X, Y, Z, R, G, B, Mask)
+    Samples 50% points from the target object and 50% from the surrounding background.
+    This gives the network spatial context (like seeing the floor) to infer occluded Z-heights.
     """
-
     def __init__(self, data_root, num_points=1024, is_train=True):
         super().__init__()
-        self.data_root  = data_root
+        self.data_root = data_root
         self.num_points = num_points
-        self.is_train   = is_train
+        self.is_train = is_train
 
         self.instances = []
-        folders = sorted(f for f in glob.glob(os.path.join(data_root, "*"))
-                         if os.path.isdir(f))
+        folders = [f for f in sorted(glob.glob(os.path.join(data_root, "*"))) if os.path.isdir(f)]
 
-        print("Scanning dataset for objects …")
+        print("Scanning dataset for contextual objects...")
         for folder in folders:
             bbox_path = os.path.join(folder, "bbox3d.npy")
             if os.path.exists(bbox_path):
                 bboxes = np.load(bbox_path, allow_pickle=True)
-                n = len(bboxes) if bboxes.ndim >= 2 else 0
-                for i in range(n):
-                    self.instances.append((folder, i))
-        print(f"Found {len(self.instances)} individual objects.")
+                n_objects = len(bboxes) if bboxes.ndim >= 2 else 0
+                for inst_idx in range(n_objects):
+                    self.instances.append((folder, inst_idx))
 
     def __len__(self):
         return len(self.instances)
@@ -63,141 +35,109 @@ class PointCloudInstanceDataset(Dataset):
     def __getitem__(self, idx):
         folder, inst_idx = self.instances[idx]
 
-        # ── load ──────────────────────────────────────────────────────────
-        img   = cv2.imread(os.path.join(folder, "rgb.jpg"))          # (H,W,3) BGR
-        pc    = np.load(os.path.join(folder, "pc.npy"),
-                        allow_pickle=True).astype(np.float32)         # (3,H,W)
-        masks = np.load(os.path.join(folder, "mask.npy"),
-                        allow_pickle=True)                             # (N,H,W)
-        bboxes = np.load(os.path.join(folder, "bbox3d.npy"),
-                         allow_pickle=True).astype(np.float32)        # (N,8,3)
+        img_path = os.path.join(folder, "rgb.jpg")
+        pc_path = os.path.join(folder, "pc.npy")
+        mask_path = os.path.join(folder, "mask.npy")
+        bbox_path = os.path.join(folder, "bbox3d.npy")
 
-        # ── extract instance ───────────────────────────────────────────────
-        mask = masks[inst_idx]
-        y_idx, x_idx = np.where(mask)
+        img = cv2.imread(img_path)
+        pc = np.load(pc_path, allow_pickle=True).astype(np.float32)
+        masks = np.load(mask_path, allow_pickle=True)
+        bboxes = np.load(bbox_path, allow_pickle=True).astype(np.float32)
 
-        if len(y_idx) == 0:
-            pts = np.zeros((6, self.num_points), dtype=np.float32)
-            tgt = np.zeros((24,), dtype=np.float32)
-            return {"points": torch.from_numpy(pts),
-                    "target": torch.from_numpy(tgt)}
+        m = masks[inst_idx]
+        obj_y, obj_x = np.where(m)
+        bg_y, bg_x = np.where(~m)  # The surrounding background
 
-        # XYZ
-        pc_pts = pc[:, y_idx, x_idx]              # (3, P)
-        # RGB  (BGR→RGB, normalise)
-        rgb_pts = img[y_idx, x_idx, ::-1].astype(np.float32) / 255.0  # (P,3)
-        rgb_pts = rgb_pts.T                        # (3, P)
+        if len(obj_y) == 0:
+            return {'points': torch.zeros((7, self.num_points)), 'target': torch.zeros(24), 'anchor': torch.zeros(3)}
 
-        # ── Step 1: remove zero/invalid points (missing depth) ────────────
-        valid = pc_pts[2] > 0.01
-        if valid.sum() > 10:
-            pc_pts  = pc_pts[:, valid]
-            rgb_pts = rgb_pts[:, valid]
+        # Extract Object Points
+        pc_obj = pc[:, obj_y, obj_x]
+        rgb_obj = img[obj_y, obj_x, ::-1].astype(np.float32).transpose(1, 0) / 255.0
 
-        # ── Step 2: robust outlier removal using MAD ──────────────────────
-        # IQR breaks when >25% of mask pixels are background leaks.
-        # MAD has a 50% breakdown point — survives much heavier contamination.
-        if pc_pts.shape[1] > 10:
-            med = np.median(pc_pts, axis=1, keepdims=True)       # (3,1)
-            mad = np.median(np.abs(pc_pts - med), axis=1,
-                            keepdims=True) + 1e-6                 # (3,1)
-            inlier = np.all(np.abs(pc_pts - med) < 5.0 * mad, axis=0)
-            if inlier.sum() > 10:
-                pc_pts  = pc_pts[:, inlier]
-                rgb_pts = rgb_pts[:, inlier]
+        # Extract Background Points
+        pc_bg = pc[:, bg_y, bg_x]
+        rgb_bg = img[bg_y, bg_x, ::-1].astype(np.float32).transpose(1, 0) / 255.0
 
-        # ── Step 3: input_anchor = median of the extracted point cloud ─────
-        # Median is more robust to outliers than the mean. Using a point-cloud
-        # based anchor ensures that the reference point for the *input* is
-        # identical between training and inference.
-        # ── Step 3: input_anchor = median of the extracted point cloud ─────
+        # Filter valid depths (> 1cm)
+        valid_obj = np.linalg.norm(pc_obj, axis=0) > 0.01
+        pc_obj, rgb_obj = pc_obj[:, valid_obj], rgb_obj[:, valid_obj]
 
-        input_anchor = np.median(pc_pts, axis=1)  # (3,)
+        valid_bg = np.linalg.norm(pc_bg, axis=0) > 0.01
+        pc_bg, rgb_bg = pc_bg[:, valid_bg], rgb_bg[:, valid_bg]
 
-        # ── subsample / pad ────────────────────────────────────────────────
+        # Contextual Sampling: 50% Object, 50% Background Context
+        n_obj_samples = self.num_points // 2
+        n_bg_samples = self.num_points - n_obj_samples
 
-        P = pc_pts.shape[1]
-        choice = np.random.choice(P, self.num_points, replace=(P < self.num_points))
-        pc_pts = pc_pts[:, choice]
-        rgb_pts = rgb_pts[:, choice]
+        N_obj, N_bg = pc_obj.shape[1], pc_bg.shape[1]
 
-        # Centre input around input_anchor
+        if N_obj > 0:
+            choice_obj = np.random.choice(N_obj, n_obj_samples, replace=(N_obj < n_obj_samples))
+            pc_obj, rgb_obj = pc_obj[:, choice_obj], rgb_obj[:, choice_obj]
+        else:
+            pc_obj, rgb_obj = np.zeros((3, n_obj_samples), dtype=np.float32), np.zeros((3, n_obj_samples), dtype=np.float32)
 
-        pc_c = pc_pts - input_anchor.reshape(3, 1)  # (3, N) centred
+        if N_bg > 0:
+            choice_bg = np.random.choice(N_bg, n_bg_samples, replace=(N_bg < n_bg_samples))
+            pc_bg, rgb_bg = pc_bg[:, choice_bg], rgb_bg[:, choice_bg]
+        else:
+            pc_bg, rgb_bg = np.zeros((3, n_bg_samples), dtype=np.float32), np.zeros((3, n_bg_samples), dtype=np.float32)
 
-        # ── target: anchor and relative corners ───────────────────────────
+        # Append Binary Mask Channel
+        mask_obj = np.ones((1, n_obj_samples), dtype=np.float32)
+        mask_bg = np.zeros((1, n_bg_samples), dtype=np.float32)
 
-        target_box = bboxes[inst_idx]  # (8, 3) absolute
-        gt_anchor = target_box.mean(axis=0)  # (3,)   box center (absolute)
-        anchor_offset = gt_anchor - input_anchor  # (3,)   what center head predicts
+        pc_combined = np.concatenate([pc_obj, pc_bg], axis=1)
+        rgb_combined = np.concatenate([rgb_obj, rgb_bg], axis=1)
+        mask_combined = np.concatenate([mask_obj, mask_bg], axis=1)
 
-        # ═══════════════════════════════════════════════════════════════════
+        # Geometry Centering (Anchored strictly to the OBJECT, ignoring background drift)
+        anchor = np.median(pc_obj, axis=1) if N_obj > 0 else np.zeros(3, dtype=np.float32)
+        pc_centered = pc_combined - anchor.reshape(3, 1)
 
-        # CRITICAL FIX: corners relative to input_anchor, NOT gt_anchor
+        target_box = bboxes[inst_idx]
+        target_offsets = target_box - anchor.reshape(1, 3)
 
-        # This ensures pred (local_corners + center) and target are in the
+        # Build 7-Channel Tensor
+        features = np.concatenate([pc_centered, rgb_combined, mask_combined], axis=0) # (7, 1024)
 
-        # same coordinate frame during loss computation.
-
-        # ═══════════════════════════════════════════════════════════════════
-
-        target_corners = target_box - input_anchor.reshape(1, 3)  # (8, 3) rel to input anchor
-
-        # ════════════════════════════════════════════════════════════════════
-        # AUGMENTATION (training only)
-        # ════════════════════════════════════════════════════════════════════
         if self.is_train:
+            # 1. Z-Rotation
+            theta = np.random.uniform(0, 2*np.pi)
+            c, s = np.cos(theta), np.sin(theta)
+            R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
+            features[:3, :] = R @ features[:3, :]
+            target_offsets = (R @ target_offsets.T).T
 
-            # 1. Random rotation around Z (gravity) axis — ±180°
-            #    Rotation must be applied consistently to points, anchor and box corners.
-            angle = np.random.uniform(-np.pi, np.pi)
-            R     = _rot_z(angle)                 # (3,3)
-            pc_c           = R @ pc_c              # (3,N)
-            anchor_offset  = R @ anchor_offset     # (3,)
-            target_corners = (R @ target_corners.T).T  # (8,3)
+            # 2. Scale jitter
+            scale = np.random.uniform(0.9, 1.1)
+            features[:3, :] *= scale
+            target_offsets *= scale
 
-            # 2. Random scale jitter ±10 %
-            scale           = np.random.uniform(0.90, 1.10)
-            pc_c           *= scale
-            anchor_offset  *= scale
-            target_corners *= scale
-
-            # 3. Random axis-aligned reflections (X and/or Y)
-            for axis in range(2):
-                if np.random.rand() < 0.5:
-                    pc_c[axis]           = -pc_c[axis]
-                    anchor_offset[axis]  = -anchor_offset[axis]
-                    target_corners[:, axis] = -target_corners[:, axis]
-
-            # 4. Point dropout — randomly zero-out up to 10 % of points
-            if np.random.rand() < 0.5:
-                drop_n = np.random.randint(1, max(2, self.num_points // 10))
-                drop_idx = np.random.choice(self.num_points, drop_n, replace=False)
-                pc_c[:, drop_idx]  = 0.0
-                rgb_pts[:, drop_idx] = 0.0
-
-            # 5. Vertical (Z) shift jitter ±2 cm — makes model robust to Z-offset
-            #    between surface points and box centre.
+            # 3. Z-shift (Jitter the relative cloud slightly to make it robust)
             z_shift = np.random.uniform(-0.02, 0.02)
-            pc_c[2]           += z_shift
-            anchor_offset[2]  += z_shift
-            # target_corners stay the same as they are relative to the anchor
+            features[2, :] += z_shift
+            target_offsets[:, 2] += z_shift
 
-            # 6. Gaussian noise on XYZ (slightly stronger than before)
-            pc_c += np.random.randn(*pc_c.shape).astype(np.float32) * 0.003
+            # 4. Point Dropout
+            if np.random.rand() > 0.5:
+                drop_n = np.random.randint(1, self.num_points // 10)
+                drop_idx = np.random.choice(self.num_points, drop_n, replace=False)
+                features[:6, drop_idx] = 0.0 # Leave mask channel intact
 
-            # 7. Colour jitter on RGB channels
-            #    Independent brightness/contrast per channel
-            for c in range(3):
-                alpha = np.random.uniform(0.8, 1.2)   # contrast
-                beta  = np.random.uniform(-0.05, 0.05) # brightness
-                rgb_pts[c] = np.clip(alpha * rgb_pts[c] + beta, 0.0, 1.0)
+            # 5. Gaussian noise
+            features[:3, :] += np.random.randn(3, self.num_points).astype(np.float32) * 0.003
 
-        # ── assemble feature tensor (6, N) ────────────────────────────────
-        features = np.concatenate([pc_c, rgb_pts], axis=0).astype(np.float32)
+            # 6. Color jitter
+            for c_idx in range(3, 6):
+                alpha = np.random.uniform(0.8, 1.2)
+                beta = np.random.uniform(-0.05, 0.05)
+                features[c_idx, :] = np.clip(alpha * features[c_idx, :] + beta, 0.0, 1.0)
 
         return {
-            "points": torch.from_numpy(features),              # (6, 1024)
-            "anchor": torch.from_numpy(anchor_offset.astype(np.float32)), # (3,)
-            "target": torch.from_numpy(target_corners.flatten().astype(np.float32)), # (24,)
+            'points': torch.from_numpy(features.astype(np.float32)), # (7, 1024)
+            'target': torch.from_numpy(target_offsets.flatten().astype(np.float32)), # (24,)
+            'anchor': torch.from_numpy(anchor.astype(np.float32))
         }

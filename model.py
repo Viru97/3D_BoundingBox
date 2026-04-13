@@ -2,97 +2,116 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class PointNetBBox(nn.Module):
-    """
-    Pure 6D Pose Regression PointNet (No T-Net!).
-    By removing the T-Net, the network maintains spatial awareness of the
-    absolute rotation, which is strictly required for 3D Pose Estimation.
-    """
-    def __init__(self, in_channels=6, num_points=1024):
+
+def get_graph_feature(x, k=20):
+    B, C, N = x.size()
+    x_trans = x.transpose(1, 2)
+    dist = torch.cdist(x_trans, x_trans)
+    idx = dist.topk(k=k, dim=-1, largest=False)[1]
+    idx_base = torch.arange(0, B, device=x.device).view(-1, 1, 1) * N
+    idx = (idx + idx_base).view(-1)
+    feature = x_trans.contiguous().view(B * N, C)[idx, :]
+    feature = feature.view(B, N, k, C).permute(0, 3, 1, 2).contiguous()
+    x_expand = x.view(B, C, N, 1).expand(B, C, N, k)
+    return torch.cat((feature - x_expand, x_expand), dim=1)
+
+
+class EdgeConv(nn.Module):
+    def __init__(self, in_channels, out_channels, k=20):
         super().__init__()
-        self.in_channels = in_channels
+        self.k = k
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels * 2, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
 
-        # ── Point feature extraction ────────────────────────────────────────
-        self.conv1 = nn.Conv1d(in_channels, 64,  1)
-        self.conv2 = nn.Conv1d(64,          128, 1)
-        self.conv3 = nn.Conv1d(128,         256, 1)
-        self.conv4 = nn.Conv1d(256,         1024, 1)
+    def forward(self, x):
+        x = get_graph_feature(x, self.k)
+        x = self.conv(x)
+        return x.max(dim=-1, keepdim=False)[0]
 
-        self.bn1   = nn.BatchNorm1d(64)
-        self.bn2   = nn.BatchNorm1d(128)
-        self.bn3   = nn.BatchNorm1d(256)
-        self.bn4   = nn.BatchNorm1d(1024)
 
-        # ── Global regression MLP ───────────────────────────────────────────
-        self.fc1   = nn.Linear(1024, 512)
-        self.fc2   = nn.Linear(512,  256)
-        self.fc3   = nn.Linear(256,  128)
+class DGCNNBBox(nn.Module):
+    """
+    Dynamic Graph CNN updated to accept 7 channels (XYZ + RGB + Mask).
+    """
 
-        self.bn5   = nn.BatchNorm1d(512)
-        self.bn6   = nn.BatchNorm1d(256)
-        self.bn7   = nn.BatchNorm1d(128)
+    def __init__(self, in_channels=7, k=20):
+        super().__init__()
+        self.k = k
 
-        self.drop1 = nn.Dropout(p=0.4)
-        self.drop2 = nn.Dropout(p=0.4)
+        self.edge1 = EdgeConv(in_channels, 64, k)
+        self.edge2 = EdgeConv(64, 64, k)
+        self.edge3 = EdgeConv(64, 128, k)
+        self.edge4 = EdgeConv(128, 256, k)
 
-        # ── Disentangled output heads ───────────────────────────────────────
-        self.fc_center = nn.Linear(128, 3)   # centre offset from anchor
-        self.fc_dims   = nn.Linear(128, 3)   # log half-extents
-        self.fc_rot    = nn.Linear(128, 6)   # 6D continuous rotation
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(512, 1024, kernel_size=1, bias=False),
+            nn.BatchNorm1d(1024),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
 
-        # ── SMART INITIALIZATION ────────────────────────────────────────────
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+
+        self.bn1 = nn.BatchNorm1d(512)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.drop = nn.Dropout(p=0.4)
+
+        self.fc_center = nn.Linear(256, 3)
+        self.fc_dims = nn.Linear(256, 3)
+        self.fc_rot = nn.Linear(256, 6)
+
+        # Smart Init (Identity Rotation + ~13cm starting box)
         nn.init.zeros_(self.fc_center.weight)
         nn.init.zeros_(self.fc_center.bias)
-
         nn.init.zeros_(self.fc_dims.weight)
-        # Log(-2.0) = 0.135m -> This starts the model at ~13cm boxes instead of 1 meter
         self.fc_dims.bias.data = torch.tensor([-2.0, -2.0, -2.0])
-
         nn.init.zeros_(self.fc_rot.weight)
-        # Identity rotation (x=[1,0,0], y=[0,1,0]) to prevent NaN division in Gram-Schmidt
         self.fc_rot.bias.data = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
 
     def forward(self, x):
-        # x : (B, 6, N)
-        h = F.relu(self.bn1(self.conv1(x)))
-        h = F.relu(self.bn2(self.conv2(h)))
-        h = F.relu(self.bn3(self.conv3(h)))
-        h = F.relu(self.bn4(self.conv4(h)))
+        x1 = self.edge1(x)
+        x2 = self.edge2(x1)
+        x3 = self.edge3(x2)
+        x4 = self.edge4(x3)
 
-        # Global descriptors (max-pool)
-        g = h.max(dim=2)[0]               # (B, 1024)
+        x_cat = torch.cat((x1, x2, x3, x4), dim=1)
+        x_out = self.conv5(x_cat)
+        g = x_out.max(dim=2)[0]
 
-        # Regression MLP
-        g = F.relu(self.bn5(self.fc1(g)))
-        g = self.drop1(g)
-        g = F.relu(self.bn6(self.fc2(g)))
-        g = self.drop2(g)
-        g = F.relu(self.bn7(self.fc3(g)))     # (B, 128)
+        g = F.leaky_relu(self.bn1(self.fc1(g)), negative_slope=0.2)
+        g = self.drop(g)
+        g = F.leaky_relu(self.bn2(self.fc2(g)), negative_slope=0.2)
+        g = self.drop(g)
 
         center_offset = self.fc_center(g)
-        log_dims      = torch.clamp(self.fc_dims(g), min=-3.5, max=2.0)
-        rot6d         = self.fc_rot(g)
+        log_dims = torch.clamp(self.fc_dims(g), min=-3.5, max=2.0)
+        rot6d = self.fc_rot(g)
 
-        # Notice: Returning 3 items now!
         return center_offset, log_dims, rot6d
 
     def get_3d_box(self, center, log_dims, rot6d):
         B = center.shape[0]
-
-        dims = torch.exp(log_dims) / 2.0       # (B, 3)
+        dims = torch.exp(log_dims) / 2.0
 
         unit = torch.tensor([
-            [-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],
-            [-1,-1, 1],[1,-1, 1],[1,1, 1],[-1,1, 1],
-        ], dtype=torch.float32, device=center.device)
-        corners = unit.unsqueeze(0) * dims.unsqueeze(1)  # (B, 8, 3)
+            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+        ], dtype=torch.float32, device=center.device).unsqueeze(0).repeat(B, 1, 1)
 
-        # 6D → orthogonal rotation matrix (Gram-Schmidt)
-        x_raw = rot6d[:, :3]
-        y_raw = rot6d[:, 3:]
+        corners = unit * dims.unsqueeze(1)
+
+        x_raw = rot6d[:, 0:3]
+        y_raw = rot6d[:, 3:6]
+
         x = F.normalize(x_raw, p=2, dim=1, eps=1e-6)
-        y = F.normalize(y_raw - (x * y_raw).sum(1, keepdim=True) * x, p=2, dim=1, eps=1e-6)
+        y = y_raw - (x * y_raw).sum(dim=1, keepdim=True) * x
+        y = F.normalize(y, p=2, dim=1, eps=1e-6)
         z = torch.cross(x, y, dim=1)
-        R = torch.stack([x, y, z], dim=-1)     # (B, 3, 3)
 
-        return torch.bmm(corners, R.transpose(1, 2)) + center.unsqueeze(1)
+        R = torch.stack([x, y, z], dim=-1)
+        rotated_corners = torch.bmm(corners, R.transpose(1, 2))
+
+        return rotated_corners + center.unsqueeze(1)

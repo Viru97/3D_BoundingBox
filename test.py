@@ -24,7 +24,8 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Subset
 from scipy.optimize import linear_sum_assignment
 
-from dataset import PointCloudInstanceDataset, collate_fn_test
+# FIX: Removed collate_fn_test from import since it is defined below
+from dataset import PointCloudInstanceDataset
 from model   import PointNetBBox
 
 
@@ -101,7 +102,9 @@ def main(args):
     num_points  = saved_args.get("num_points", 1024)
 
     model = PointNetBBox(in_channels=6, num_points=num_points).to(device)
-    model.load_state_dict(ckpt["model"])
+    # Safely extract state_dict
+    state_dict = ckpt.get("model", ckpt)
+    model.load_state_dict(state_dict)
     model.eval()
     print(f"Loaded: {args.checkpoint}  (epoch {ckpt.get('epoch','?')}, "
           f"best val median MCD={ckpt.get('best_mcd', float('nan')):.4f} m)")
@@ -133,7 +136,8 @@ def main(args):
             pts = batch["points"].to(device)          # (B, 6, N)
             tgt = batch["target"].to(device).view(-1, 8, 3).float()  # (B,8,3)
 
-            center, log_dims, rot6d, _ = model(pts)
+            # FIX: Only unpack 3 values based on current model.py
+            center, log_dims, rot6d = model(pts)
             pred = model.get_3d_box(center, log_dims, rot6d).float()  # (B,8,3)
 
             for b in range(pts.shape[0]):
@@ -233,7 +237,6 @@ def main(args):
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"JSON summary saved: {json_path}")
-
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()

@@ -8,8 +8,8 @@ from torch.utils.data import Dataset
 class PointCloudInstanceDataset(Dataset):
     """
     Contextual Sampling Dataset (7-Channels: X, Y, Z, R, G, B, Mask)
-    Samples 50% points from the target object and 50% from the surrounding background.
-    This gives the network spatial context (like seeing the floor) to infer occluded Z-heights.
+    Reverted to lightning-fast Vectorized Random Sampling. DGCNN natively
+    handles edge-detection without needing the massive O(N*K) CPU overhead of FPS.
     """
     def __init__(self, data_root, num_points=1024, is_train=True):
         super().__init__()
@@ -47,32 +47,29 @@ class PointCloudInstanceDataset(Dataset):
 
         m = masks[inst_idx]
         obj_y, obj_x = np.where(m)
-        bg_y, bg_x = np.where(~m)  # The surrounding background
+        bg_y, bg_x = np.where(~m)
 
         if len(obj_y) == 0:
             return {'points': torch.zeros((7, self.num_points)), 'target': torch.zeros(24), 'anchor': torch.zeros(3)}
 
-        # Extract Object Points
         pc_obj = pc[:, obj_y, obj_x]
         rgb_obj = img[obj_y, obj_x, ::-1].astype(np.float32).transpose(1, 0) / 255.0
 
-        # Extract Background Points
         pc_bg = pc[:, bg_y, bg_x]
         rgb_bg = img[bg_y, bg_x, ::-1].astype(np.float32).transpose(1, 0) / 255.0
 
-        # Filter valid depths (> 1cm)
         valid_obj = np.linalg.norm(pc_obj, axis=0) > 0.01
         pc_obj, rgb_obj = pc_obj[:, valid_obj], rgb_obj[:, valid_obj]
 
         valid_bg = np.linalg.norm(pc_bg, axis=0) > 0.01
         pc_bg, rgb_bg = pc_bg[:, valid_bg], rgb_bg[:, valid_bg]
 
-        # Contextual Sampling: 50% Object, 50% Background Context
         n_obj_samples = self.num_points // 2
         n_bg_samples = self.num_points - n_obj_samples
 
         N_obj, N_bg = pc_obj.shape[1], pc_bg.shape[1]
 
+        # SPEED OPTIMIZATION: Instant vectorized random choice (Prevents CPU data-starvation)
         if N_obj > 0:
             choice_obj = np.random.choice(N_obj, n_obj_samples, replace=(N_obj < n_obj_samples))
             pc_obj, rgb_obj = pc_obj[:, choice_obj], rgb_obj[:, choice_obj]
@@ -85,7 +82,6 @@ class PointCloudInstanceDataset(Dataset):
         else:
             pc_bg, rgb_bg = np.zeros((3, n_bg_samples), dtype=np.float32), np.zeros((3, n_bg_samples), dtype=np.float32)
 
-        # Append Binary Mask Channel
         mask_obj = np.ones((1, n_obj_samples), dtype=np.float32)
         mask_bg = np.zeros((1, n_bg_samples), dtype=np.float32)
 
@@ -93,51 +89,48 @@ class PointCloudInstanceDataset(Dataset):
         rgb_combined = np.concatenate([rgb_obj, rgb_bg], axis=1)
         mask_combined = np.concatenate([mask_obj, mask_bg], axis=1)
 
-        # Geometry Centering (Anchored strictly to the OBJECT, ignoring background drift)
         anchor = np.median(pc_obj, axis=1) if N_obj > 0 else np.zeros(3, dtype=np.float32)
         pc_centered = pc_combined - anchor.reshape(3, 1)
 
         target_box = bboxes[inst_idx]
         target_offsets = target_box - anchor.reshape(1, 3)
 
-        # Build 7-Channel Tensor
-        features = np.concatenate([pc_centered, rgb_combined, mask_combined], axis=0) # (7, 1024)
+        features = np.concatenate([pc_centered, rgb_combined, mask_combined], axis=0)
 
         if self.is_train:
-            # 1. Z-Rotation
             theta = np.random.uniform(0, 2*np.pi)
             c, s = np.cos(theta), np.sin(theta)
             R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
             features[:3, :] = R @ features[:3, :]
             target_offsets = (R @ target_offsets.T).T
 
-            # 2. Scale jitter
+            for axis in range(2):
+                if np.random.rand() < 0.5:
+                    features[axis, :]         = -features[axis, :]
+                    target_offsets[:, axis]   = -target_offsets[:, axis]
+
             scale = np.random.uniform(0.9, 1.1)
             features[:3, :] *= scale
             target_offsets *= scale
 
-            # 3. Z-shift (Jitter the relative cloud slightly to make it robust)
             z_shift = np.random.uniform(-0.02, 0.02)
             features[2, :] += z_shift
             target_offsets[:, 2] += z_shift
 
-            # 4. Point Dropout
             if np.random.rand() > 0.5:
                 drop_n = np.random.randint(1, self.num_points // 10)
                 drop_idx = np.random.choice(self.num_points, drop_n, replace=False)
-                features[:6, drop_idx] = 0.0 # Leave mask channel intact
+                features[:6, drop_idx] = 0.0
 
-            # 5. Gaussian noise
             features[:3, :] += np.random.randn(3, self.num_points).astype(np.float32) * 0.003
 
-            # 6. Color jitter
             for c_idx in range(3, 6):
                 alpha = np.random.uniform(0.8, 1.2)
                 beta = np.random.uniform(-0.05, 0.05)
                 features[c_idx, :] = np.clip(alpha * features[c_idx, :] + beta, 0.0, 1.0)
 
         return {
-            'points': torch.from_numpy(features.astype(np.float32)), # (7, 1024)
-            'target': torch.from_numpy(target_offsets.flatten().astype(np.float32)), # (24,)
+            'points': torch.from_numpy(features.astype(np.float32)),
+            'target': torch.from_numpy(target_offsets.flatten().astype(np.float32)),
             'anchor': torch.from_numpy(anchor.astype(np.float32))
         }

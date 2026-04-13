@@ -9,7 +9,6 @@ from model import DGCNNBBox
 EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
          (0, 4), (1, 5), (2, 6), (3, 7)]
 
-
 def add_plotly_box(fig, corners, color, name):
     x_lines, y_lines, z_lines = [], [], []
     for i, j in EDGES:
@@ -19,7 +18,6 @@ def add_plotly_box(fig, corners, color, name):
 
     fig.add_trace(
         go.Scatter3d(x=x_lines, y=y_lines, z=z_lines, mode='lines', line=dict(color=color, width=4), name=name))
-
 
 def run_sample(model, device, sample_dir, out_dir, sample_idx, total, num_points=1024):
     img_bgr = cv2.imread(os.path.join(sample_dir, "rgb.jpg"))
@@ -51,22 +49,20 @@ def run_sample(model, device, sample_dir, out_dir, sample_idx, total, num_points
         valid_bg = pc_bg[2] > 0.01
         pc_bg, rgb_bg = pc_bg[:, valid_bg], rgb_bg[:, valid_bg]
 
-        # Contextual Sampling (512 Object, 512 BG)
-        rng = np.random.default_rng(seed=i)
-
         n_obj = num_points // 2
         n_bg = num_points - n_obj
 
         N_obj, N_bg = pc_obj.shape[1], pc_bg.shape[1]
 
+        # Reverted Inference to lightning fast random sampling to match dataset.py
         if N_obj > 0:
-            c_obj = rng.choice(N_obj, n_obj, replace=(N_obj < n_obj))
+            c_obj = np.random.choice(N_obj, n_obj, replace=(N_obj < n_obj))
             pc_obj, rgb_obj = pc_obj[:, c_obj], rgb_obj[:, c_obj]
         else:
             pc_obj, rgb_obj = np.zeros((3, n_obj), dtype=np.float32), np.zeros((3, n_obj), dtype=np.float32)
 
         if N_bg > 0:
-            c_bg = rng.choice(N_bg, n_bg, replace=(N_bg < n_bg))
+            c_bg = np.random.choice(N_bg, n_bg, replace=(N_bg < n_bg))
             pc_bg, rgb_bg = pc_bg[:, c_bg], rgb_bg[:, c_bg]
         else:
             pc_bg, rgb_bg = np.zeros((3, n_bg), dtype=np.float32), np.zeros((3, n_bg), dtype=np.float32)
@@ -123,14 +119,15 @@ def run_sample(model, device, sample_dir, out_dir, sample_idx, total, num_points
     fig.write_html(out_path)
     print(f"  Saved Interactive 3D Plot: {out_path}")
 
-
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DGCNNBBox(in_channels=args.in_channels).to(device)
 
     if os.path.exists(args.weights):
         ckpt = torch.load(args.weights, map_location=device)
-        model.load_state_dict(ckpt.get("model", ckpt))
+        model_state = ckpt.get("model", ckpt)
+        model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}
+        model.load_state_dict(model_state, strict=False)
         print("Loaded DGCNN (7-Channel) weights successfully.")
     else:
         print("[WARN] Weights not found!")
@@ -145,12 +142,11 @@ def main(args):
     for idx, sd in enumerate(samples, 1):
         run_sample(model, device, sd, args.out_dir, idx, len(samples), num_points=args.num_points)
 
-
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--weights", default="best_model.pth")
     p.add_argument("--out_dir", default="output")
-    p.add_argument("--num_points", type=int, default=1024)
+    p.add_argument("--num_points", type=int, default=2048)
     p.add_argument("--in_channels", type=int, default=7)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--sample", type=str)

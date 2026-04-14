@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sereact_3d_bbox"
+version = "0.1.0"
+description = "Sereact 3D Bounding Box project"
+dependencies = [
+    "numpy",
+    "torch",
+    "opencv-python",
+    "plotly",
+    "scipy",
+    "matplotlib"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

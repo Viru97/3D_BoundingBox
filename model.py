@@ -4,25 +4,15 @@ import torch.nn.functional as F
 
 
 def get_graph_feature(x, k=20):
-    """
-    Build k-NN edge features for DGCNN.
-    Restored torch.cdist logic - it is highly optimized via ATen kernels in PyTorch 2.x
-    and compiles perfectly with torch.compile() for ultra-fast GPU execution.
-    """
     B, C, N = x.size()
-    x_trans = x.transpose(1, 2)  # (B, N, C)
-
-    # PyTorch's native cdist is blazing fast and dynamically fused on modern GPUs
-    dist = torch.cdist(x_trans, x_trans)  # (B, N, N)
-
-    idx = dist.topk(k=k, dim=-1, largest=False)[1]  # (B, N, k)
+    x_trans = x.transpose(1, 2)
+    dist = torch.cdist(x_trans, x_trans)
+    idx = dist.topk(k=k, dim=-1, largest=False)[1]
     idx_base = torch.arange(0, B, device=x.device).view(-1, 1, 1) * N
     idx = (idx + idx_base).view(-1)
-
     feature = x_trans.contiguous().view(B * N, C)[idx, :]
     feature = feature.view(B, N, k, C).permute(0, 3, 1, 2).contiguous()
     x_expand = x.view(B, C, N, 1).expand(B, C, N, k)
-
     return torch.cat((feature - x_expand, x_expand), dim=1)
 
 
@@ -43,6 +33,10 @@ class EdgeConv(nn.Module):
 
 
 class DGCNNBBox(nn.Module):
+    """
+    Dynamic Graph CNN updated to accept 7 channels (XYZ + RGB + Mask).
+    """
+
     def __init__(self, in_channels=7, k=20):
         super().__init__()
         self.k = k
@@ -69,6 +63,7 @@ class DGCNNBBox(nn.Module):
         self.fc_dims = nn.Linear(256, 3)
         self.fc_rot = nn.Linear(256, 6)
 
+        # Smart Init (Identity Rotation + ~13cm starting box)
         nn.init.zeros_(self.fc_center.weight)
         nn.init.zeros_(self.fc_center.bias)
         nn.init.zeros_(self.fc_dims.weight)
@@ -104,9 +99,9 @@ class DGCNNBBox(nn.Module):
         unit = torch.tensor([
             [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
             [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
-        ], dtype=torch.float32, device=center.device)
+        ], dtype=torch.float32, device=center.device).unsqueeze(0).repeat(B, 1, 1)
 
-        corners = unit.unsqueeze(0) * dims.unsqueeze(1)
+        corners = unit * dims.unsqueeze(1)
 
         x_raw = rot6d[:, 0:3]
         y_raw = rot6d[:, 3:6]

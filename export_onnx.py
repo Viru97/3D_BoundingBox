@@ -1,19 +1,8 @@
-"""
-export_onnx.py  —  Export DGCNNBBox to ONNX
-================================================================
-RESTORED: Correctly exports the 7-Channel DGCNN model using Opset 18
-instead of crashing by trying to load the old Phase-1 2D ResNet.
-
-Usage:
-    python scripts/export_onnx.py --checkpoint best_model.pth --out_dir onnx_export
-"""
-
 import os, argparse
+import numpy as np
 import torch
 import torch.nn as nn
-from sereact_bbox.model import DGCNNBBox
-from sereact_bbox.config import DEFAULT_CHECKPOINT, DEFAULT_ONNX_DIR, ModelConfig, DataConfig
-
+from model import DGCNNBBox
 
 class OnnxWrapper(nn.Module):
     def __init__(self, model):
@@ -26,27 +15,23 @@ class OnnxWrapper(nn.Module):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_points = DataConfig.num_points
+    num_points = 1024
 
-    model = DGCNNBBox(in_channels=ModelConfig.in_channels).to(device)
+    # Instantiate the 7-channel DGCNN
+    model = DGCNNBBox(in_channels=7).to(device)
 
     if os.path.exists(args.checkpoint):
-        # FIX: weights_only=False added for PyTorch 2.6+
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model_state = ckpt.get("model", ckpt)
-        # Handle uncompiled model loading into standard or compiled definitions easily
-        model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}
-        model.load_state_dict(model_state, strict=False)
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt.get("model", ckpt))
         print(f"Loaded weights from {args.checkpoint}")
     else:
         print("[WARN] Checkpoint not found. Exporting random initialization.")
 
     model.eval()
     wrapper = OnnxWrapper(model).to(device)
-    wrapper.eval()
 
     # 7 channels for (X, Y, Z, R, G, B, Mask)
-    dummy = torch.randn(1, ModelConfig.in_channels, num_points, device=device)
+    dummy = torch.randn(1, 7, num_points, device=device)
 
     os.makedirs(args.out_dir, exist_ok=True)
     out_fp32 = os.path.join(args.out_dir, "pointnetbbox.onnx")
@@ -55,7 +40,7 @@ def main(args):
     torch.onnx.export(
         wrapper, dummy, out_fp32,
         export_params=True,
-        opset_version=18,
+        opset_version=14,
         do_constant_folding=True,
         input_names=["point_cloud"],
         output_names=["center", "log_dims", "rot6d"],
@@ -71,6 +56,6 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
-    p.add_argument("--out_dir",    default=DEFAULT_ONNX_DIR)
+    p.add_argument("--checkpoint", default="best_model.pth")
+    p.add_argument("--out_dir",    default="onnx_export")
     main(p.parse_args())

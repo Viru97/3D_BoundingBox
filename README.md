@@ -67,12 +67,29 @@ The following diagram illustrates the complete end-to-end data flow, from raw in
 
 ## 🛠️ Installation & Configuration
 
-We recommend using a virtual environment (e.g., `venv` or `conda`). The project uses a `pyproject.toml` for automated dependency management.
+### 🐳 Docker (Recommended)
+This project includes a fully portable, headless Docker container that natively handles all complex system dependencies (like OpenCV and PyTorch) without requiring local GPU driver configurations.
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-repo/sereact_3d_bbox.git
-cd sereact_3d_bbox
+# 1. Build the Docker image
+docker build -t sereact_3d_bbox .
+
+# 2. Run the container interactively (Mount your dataset and outputs)
+# Replace /path/to/dataset with your actual dataset path
+docker run -it --rm \
+    -v /path/to/dataset:/app/dataset \
+    -v $(pwd)/output:/app/output \
+    -v $(pwd)/best_model.pth:/app/best_model.pth \
+    sereact_3d_bbox
+```
+*Once inside the container, you can run any of the execution scripts below directly.*
+
+### 💻 Local Virtual Environment
+If you prefer not to use Docker, we recommend using a virtual environment (e.g., `venv` or `conda`). You can set this up after extracting the `.zip` file or cloning the repo.
+
+```bash
+# If using the zip file: unzip sereact_project.zip && cd sereact_project
+# Or, if using git: git clone https://github.com/your-username/sereact_3d_bbox.git && cd sereact_3d_bbox
 
 # Create and activate a virtual environment
 python3 -m venv .venv

@@ -44,14 +44,16 @@ def main(args):
     print(f"\nExporting FP32 ONNX (opset=18) -> {fp32_path}")
     torch.onnx.export(
         wrapper, dummy, fp32_path,
+        export_params       = True,
         opset_version       = 18,
         do_constant_folding = True,
+        dynamo              = False,
         input_names         = ["point_cloud"],
         output_names        = ["center", "log_dims", "rot6d"],
         dynamic_axes        = {"point_cloud": {0: "batch"},
                                "center":      {0: "batch"},
                                "log_dims":    {0: "batch"},
-                               "rot6d":       {0: "batch"}},
+                               "rot6d":       {0: "batch"}}
     )
     fp32_mb = os.path.getsize(fp32_path) / 1e6
     print(f"  ✓  {fp32_mb:.1f} MB")
@@ -66,20 +68,34 @@ def main(args):
 
     print("\nINT8 dynamic quantisation ...")
     try:
-        from torch.quantization import quantize_dynamic
-        model_q   = quantize_dynamic(model, {nn.Conv1d, nn.Conv2d, nn.Linear},
-                                     dtype=torch.qint8)
-        wrapper_q = OnnxWrapper(model_q); wrapper_q.eval()
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+        import onnxruntime as ort
+        
         int8_path = os.path.join(args.out_dir, "dgcnn_bbox_int8.onnx")
-        torch.onnx.export(wrapper_q, dummy, int8_path, opset_version=18,
-                          input_names=["point_cloud"],
-                          output_names=["center","log_dims","rot6d"])
+        
+        quantize_dynamic(
+            fp32_path,
+            int8_path,
+            weight_type=QuantType.QUInt8
+        )
         int8_mb = os.path.getsize(int8_path) / 1e6
         print(f"  ✓  {int8_path}  ({int8_mb:.1f} MB, {fp32_mb/int8_mb:.1f}× smaller)")
 
         print("\nCPU latency (batch=1, N=1024, 100 runs):")
-        fp32_ms = benchmark(wrapper,   dummy, label="FP32")
-        int8_ms = benchmark(wrapper_q, dummy, label="INT8")
+        def benchmark_ort(sess, dummy_np, n=100, label=""):
+            for _ in range(10): sess.run(None, {"point_cloud": dummy_np})
+            t0 = time.perf_counter()
+            for _ in range(n): sess.run(None, {"point_cloud": dummy_np})
+            ms = (time.perf_counter() - t0) / n * 1000
+            print(f"  {label:<22} {ms:.2f} ms / sample")
+            return ms
+            
+        dummy_np = dummy.numpy()
+        sess_fp32 = ort.InferenceSession(fp32_path, providers=["CPUExecutionProvider"])
+        sess_int8 = ort.InferenceSession(int8_path, providers=["CPUExecutionProvider"])
+        
+        fp32_ms = benchmark_ort(sess_fp32, dummy_np, label="ONNX FP32")
+        int8_ms = benchmark_ort(sess_int8, dummy_np, label="ONNX INT8")
         print(f"  Speedup: {fp32_ms/int8_ms:.2f}×")
     except Exception as e:
         print(f"  INT8 failed: {e}")

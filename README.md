@@ -37,6 +37,11 @@ pip install -e .
 
 ---
 
+## ⚙️ Configuration
+All core hyperparameters, thresholds, and data settings (like `num_points`) are centralized in `src/sereact_3d_bbox/config.py`. The execution scripts automatically pull defaults from this file, allowing you to globally modify parameters in one place.
+
+---
+
 ## 🚀 Usage
 
 All executable entry-points are located inside the `scripts/` directory. 
@@ -86,7 +91,7 @@ python scripts/export_onnx.py \
 Instead of treating points independently (like PointNet), **EdgeConv** layers dynamically calculate a $k$-NN graph at each network stage to merge local and global point arrangements. 
 
 ```text
-Input: (Batch, 7, 1024)
+Input: (Batch, 7, num_points)  <-- Configurable via config.py (default 2048)
        ├─ XYZ  (centred on median anchor)
        ├─ RGB  (normalized [0,1])
        └─ Mask (binary: 1=object, 0=bg context)
@@ -107,11 +112,14 @@ Input: (Batch, 7, 1024)
    (3,)     (3,)       (6,)
 ```
 
-### Tri-Partite Loss Function
+### Tri-Partite Loss Function & Evaluation Choice
 The model targets 3 separate box representations through a combined loss module (`src/sereact_3d_bbox/models/loss.py`):
 1. **Chamfer Loss:** Order-agnostic distance alignment. Highly robust early in training when rotations are stochastic.
-2. **Hungarian Smooth-L1:** Strictly computes per-corner losses after bipartite assignment, directly targeting Mean Corner Distance metrics.
+2. **Hungarian Smooth-L1:** Strictly computes per-corner losses after bipartite assignment, targeting precise geometric alignment.
 3. **Relative Centre Loss:** Predicts origin coordinates relative to the median-filtered anchor, completely eliminating spatial drift vulnerabilities.
+
+**Design Choice: MCD vs. 3D IoU**
+For both training targets and evaluation metrics, this pipeline utilizes **Mean Corner Distance (MCD)** paired with the Hungarian matching algorithm rather than the traditional 3D Intersection over Union (IoU). Exact 3D IoU computation for arbitrarily rotated boxes is mathematically unstable and typically requires compiling custom C++/CUDA extensions (e.g., relying on heavy external libraries like `mmdet3d`). MCD provides a completely Python-native, differentiable proxy that elegantly and simultaneously captures translation, scaling, and rotational errors without bloating the project dependencies.
 
 ### MAD Cleaning Pipeline
 Depth sensors inherently suffer from "bleeding" where distant background edges attach to foreground masks. 
@@ -137,6 +145,7 @@ sereact_3d_bbox/
 └── src/
     └── sereact_3d_bbox/
         ├── __init__.py
+        ├── config.py           # Centralized dataclass configurations and defaults
         ├── data/
         │   ├── __init__.py
         │   └── dataset.py      # Context dataset & MAD Filtering

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 @dataclass
 class DataConfig:
     num_points: int = 1024
-    mad_threshold: float = 5.0      # For the residual MAD filter
+    mad_threshold: float = 5      # For the residual MAD filter
     min_points_threshold: int = 10  # Minimum points required to process an object
 
 @dataclass

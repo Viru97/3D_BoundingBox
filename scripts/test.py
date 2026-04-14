@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Subset
 from scipy.optimize import linear_sum_assignment
 
+from sereact_3d_bbox.config import cfg
 from sereact_3d_bbox.data.dataset import PointCloudInstanceDataset
 from sereact_3d_bbox.models.dgcnn import DGCNNBBox
 
@@ -155,8 +156,8 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--data_root",   required=True)
-    p.add_argument("--checkpoint",  default="best_model.pth")
-    p.add_argument("--batch_size",  type=int, default=32)
+    p.add_argument("--checkpoint",  default=cfg.inference.weights)
+    p.add_argument("--batch_size",  type=int, default=cfg.train.batch_size)
     p.add_argument("--vis_dir",     default="test_output")
     p.add_argument("--max_vis",     type=int, default=20)
     main(p.parse_args())

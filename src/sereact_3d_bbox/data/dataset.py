@@ -4,19 +4,20 @@ import numpy as np
 import cv2
 import torch
 from torch.utils.data import Dataset
+from sereact_3d_bbox.config import cfg
 
-def mad_filter(pc_pts, rgb_pts, threshold=5.0):
-    if pc_pts.shape[1] < 10:
+def mad_filter(pc_pts, rgb_pts, threshold=cfg.data.mad_threshold):
+    if pc_pts.shape[1] < cfg.data.min_points_threshold:
         return pc_pts, rgb_pts
     med    = np.median(pc_pts, axis=1, keepdims=True)
     mad    = np.median(np.abs(pc_pts - med), axis=1, keepdims=True) + 1e-6
     inlier = np.all(np.abs(pc_pts - med) < threshold * mad, axis=0)
-    if inlier.sum() < 10:
+    if inlier.sum() < cfg.data.min_points_threshold:
         return pc_pts, rgb_pts
     return pc_pts[:, inlier], rgb_pts[:, inlier]
 
 class PointCloudInstanceDataset(Dataset):
-    def __init__(self, data_root, num_points=1024, is_train=True):
+    def __init__(self, data_root, num_points=cfg.data.num_points, is_train=True):
         super().__init__()
         self.num_points = num_points
         self.is_train   = is_train

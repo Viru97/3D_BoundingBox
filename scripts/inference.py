@@ -3,6 +3,7 @@ import cv2, torch
 import numpy as np
 import plotly.graph_objects as go
 
+from sereact_3d_bbox.config import cfg
 from sereact_3d_bbox.data.dataset import mad_filter, PointCloudInstanceDataset
 from sereact_3d_bbox.models.dgcnn import DGCNNBBox
 
@@ -125,9 +126,9 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--weights",    default="best_model.pth")
-    p.add_argument("--out_dir",    default="output")
-    p.add_argument("--num_points", type=int, default=1024)
+    p.add_argument("--weights",    default=cfg.inference.weights)
+    p.add_argument("--out_dir",    default=cfg.inference.out_dir)
+    p.add_argument("--num_points", type=int, default=cfg.data.num_points)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--sample",    type=str)
     g.add_argument("--data_root", type=str)

@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.amp import GradScaler, autocast
 from scipy.optimize import linear_sum_assignment
 
+from sereact_3d_bbox.config import cfg
 from sereact_3d_bbox.data.dataset import PointCloudInstanceDataset
 from sereact_3d_bbox.models.dgcnn import DGCNNBBox
 from sereact_3d_bbox.models.loss import compute_loss, mean_corner_dist
@@ -122,12 +123,12 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--data_root",   required=True)
-    p.add_argument("--epochs",      type=int,   default=100)
-    p.add_argument("--batch_size",  type=int,   default=32)
-    p.add_argument("--num_points",  type=int,   default=1024)
-    p.add_argument("--in_channels", type=int,   default=7)
-    p.add_argument("--lr",          type=float, default=1e-3)
+    p.add_argument("--epochs",      type=int,   default=cfg.train.epochs)
+    p.add_argument("--batch_size",  type=int,   default=cfg.train.batch_size)
+    p.add_argument("--num_points",  type=int,   default=cfg.data.num_points)
+    p.add_argument("--in_channels", type=int,   default=cfg.model.in_channels)
+    p.add_argument("--lr",          type=float, default=cfg.train.learning_rate)
     p.add_argument("--warmup",      type=int,   default=5)
     p.add_argument("--num_workers", type=int,   default=8)
-    p.add_argument("--save_path",   type=str,   default="best_model.pth")
+    p.add_argument("--save_path",   type=str,   default=cfg.train.save_path)
     main(p.parse_args())

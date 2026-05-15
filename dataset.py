@@ -1,3 +1,18 @@
+"""
+dataset.py  —  PointCloudInstanceDataset  (v2)
+================================================
+Augmentations added:
+  • Random rotation around gravity (Z) axis           ← most impactful
+  • Random scale jitter (±10 %)
+  • Random axis-aligned reflection (X and Y)
+  • Point dropout  (randomly zero-out up to 10 % of points)
+  • Colour jitter  (brightness / contrast on the RGB channels)
+  • Gaussian point noise (existing, tuned up slightly)
+
+Training-time anchor normalisation is unchanged so the model still
+regresses box corners relative to the point-cloud centroid.
+"""
+
 import os
 import glob
 import numpy as np
@@ -6,31 +21,40 @@ import torch
 from torch.utils.data import Dataset
 
 
+# ── rotation helpers ──────────────────────────────────────────────────────────
+def _rot_z(angle_rad):
+    """3×3 rotation matrix around the Z (gravity) axis."""
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    return np.array([[c, -s, 0],
+                     [s,  c, 0],
+                     [0,  0, 1]], dtype=np.float32)
+
+
 class PointCloudInstanceDataset(Dataset):
     """
-    Given that we have masks, this dataset extracts individual objects
-    as isolated Point Clouds (N=1024 points) with RGB features.
+    Extracts individual objects as isolated point clouds (N=1024 points)
+    with XYZ + RGB features.  Targets are the 8 GT corners *relative to
+    the point-cloud centroid* so the model is translation-invariant.
     """
 
     def __init__(self, data_root, num_points=1024, is_train=True):
         super().__init__()
-        self.data_root = data_root
+        self.data_root  = data_root
         self.num_points = num_points
-        self.is_train = is_train
+        self.is_train   = is_train
 
-        # Pre-scan dataset to find all individual instances
         self.instances = []
-        folders = [f for f in sorted(glob.glob(os.path.join(data_root, "*"))) if os.path.isdir(f)]
+        folders = sorted(f for f in glob.glob(os.path.join(data_root, "*"))
+                         if os.path.isdir(f))
 
-        print("Scanning dataset for objects...")
+        print("Scanning dataset for objects …")
         for folder in folders:
             bbox_path = os.path.join(folder, "bbox3d.npy")
             if os.path.exists(bbox_path):
                 bboxes = np.load(bbox_path, allow_pickle=True)
-                n_objects = len(bboxes) if bboxes.ndim >= 2 else 0
-                for inst_idx in range(n_objects):
-                    self.instances.append((folder, inst_idx))
-        print(self.instances)
+                n = len(bboxes) if bboxes.ndim >= 2 else 0
+                for i in range(n):
+                    self.instances.append((folder, i))
         print(f"Found {len(self.instances)} individual objects.")
 
     def __len__(self):
@@ -39,71 +63,97 @@ class PointCloudInstanceDataset(Dataset):
     def __getitem__(self, idx):
         folder, inst_idx = self.instances[idx]
 
-        # 1. Load Data
-        img_path = os.path.join(folder, "rgb.jpg")
-        pc_path = os.path.join(folder, "pc.npy")
-        mask_path = os.path.join(folder, "mask.npy")
-        bbox_path = os.path.join(folder, "bbox3d.npy")
+        # ── load ──────────────────────────────────────────────────────────
+        img   = cv2.imread(os.path.join(folder, "rgb.jpg"))          # (H,W,3) BGR
+        pc    = np.load(os.path.join(folder, "pc.npy"),
+                        allow_pickle=True).astype(np.float32)         # (3,H,W)
+        masks = np.load(os.path.join(folder, "mask.npy"),
+                        allow_pickle=True)                             # (N,H,W)
+        bboxes = np.load(os.path.join(folder, "bbox3d.npy"),
+                         allow_pickle=True).astype(np.float32)        # (N,8,3)
 
-        img = cv2.imread(img_path)  # (H, W, 3) BGR
-        pc = np.load(pc_path, allow_pickle=True).astype(np.float32)  # (3, H, W)
-        masks = np.load(mask_path, allow_pickle=True)  # (N, H, W) boolean
-        bboxes = np.load(bbox_path, allow_pickle=True).astype(np.float32)  # (N, 8, 3)
-
-        # 2. Extract specific instance
+        # ── extract instance ───────────────────────────────────────────────
         mask = masks[inst_idx]
         y_idx, x_idx = np.where(mask)
 
         if len(y_idx) == 0:
-            # Failsafe for empty mask
-            pc_points = np.zeros((3, self.num_points), dtype=np.float32)
-            rgb_points = np.zeros((3, self.num_points), dtype=np.float32)
-            target_corners = np.zeros((24,), dtype=np.float32)
-            return {'points': torch.from_numpy(np.concatenate([pc_points, rgb_points], axis=0)),
-                    'target': torch.from_numpy(target_corners)}
+            pts = np.zeros((6, self.num_points), dtype=np.float32)
+            tgt = np.zeros((24,), dtype=np.float32)
+            return {"points": torch.from_numpy(pts),
+                    "target": torch.from_numpy(tgt)}
 
-        # Extract XYZ and RGB
-        pc_points = pc[:, y_idx, x_idx]  # (3, P)
+        # XYZ
+        pc_pts = pc[:, y_idx, x_idx]              # (3, P)
+        # RGB  (BGR→RGB, normalise)
+        rgb_pts = img[y_idx, x_idx, ::-1].astype(np.float32) / 255.0  # (P,3)
+        rgb_pts = rgb_pts.T                        # (3, P)
 
-        # Convert BGR to RGB and normalize
-        rgb_points = img[y_idx, x_idx, ::-1].astype(np.float32) / 255.0  # (P, 3)
-        rgb_points = rgb_points.transpose(1, 0)  # (3, P)
+        # ── depth filter ───────────────────────────────────────────────────
+        valid = (pc_pts[2] > 0.1) & (pc_pts[2] < 1.5)
+        if valid.sum() > 10:
+            pc_pts  = pc_pts[:, valid]
+            rgb_pts = rgb_pts[:, valid]
 
-        # 3. Filter invalid depth points (z <= 0.01) BEFORE sampling and anchor computation
-        valid_depth = (pc_points[2] > 0.1) & (pc_points[2] < 1.5)
+        # ── anchor (centroid) ──────────────────────────────────────────────
+        anchor = pc_pts.mean(axis=1)              # (3,)
 
-        if valid_depth.sum() > 10:
-            pc_points = pc_points[:, valid_depth]
-            rgb_points = rgb_points[:, valid_depth]
+        # ── subsample / pad ────────────────────────────────────────────────
+        P = pc_pts.shape[1]
+        choice = np.random.choice(P, self.num_points, replace=(P < self.num_points))
+        pc_pts  = pc_pts[:, choice]
+        rgb_pts = rgb_pts[:, choice]
 
-        # 4. Geometry Centering (Crucial for translation invariance)
-        # Compute anchor on FULL (unsampled) valid point cloud for a stable center
-        anchor = pc_points.mean(axis=1)
+        # Centre around anchor
+        pc_c = pc_pts - anchor.reshape(3, 1)       # (3, N) centred
 
-        # 5. Standardize Point Count (Subsample or Pad to 1024)
-        P = pc_points.shape[1]
-        if P >= self.num_points:
-            choice = np.random.choice(P, self.num_points, replace=False)
-        else:
-            choice = np.random.choice(P, self.num_points, replace=True)
+        # ── target corners (relative to anchor) ───────────────────────────
+        target_box     = bboxes[inst_idx]          # (8, 3) absolute
+        target_offsets = target_box - anchor.reshape(1, 3)  # (8, 3) relative
 
-        pc_points = pc_points[:, choice]
-        rgb_points = rgb_points[:, choice]
-
-        pc_points_centered = pc_points - anchor.reshape(3, 1)
-
-        # Calculate target box offsets relative to anchor
-        target_box = bboxes[inst_idx]  # (8, 3)
-        target_offsets = target_box - anchor.reshape(1, 3)
-
-        # 6. Build final tensor (6, 1024) -> [X,Y,Z, R,G,B]
+        # ════════════════════════════════════════════════════════════════════
+        # AUGMENTATION (training only)
+        # ════════════════════════════════════════════════════════════════════
         if self.is_train:
-            # Data Augmentation: Add tiny jitter to points to prevent overfitting
-            pc_points_centered += np.random.randn(*pc_points_centered.shape).astype(np.float32) * 0.002
 
-        features = np.concatenate([pc_points_centered, rgb_points], axis=0)
+            # 1. Random rotation around Z (gravity) axis — ±180°
+            #    Rotation must be applied consistently to points AND box corners.
+            angle = np.random.uniform(-np.pi, np.pi)
+            R     = _rot_z(angle)                 # (3,3)
+            pc_c          = R @ pc_c              # (3,N)
+            target_offsets = (R @ target_offsets.T).T  # (8,3)
+
+            # 2. Random scale jitter ±10 %
+            scale          = np.random.uniform(0.90, 1.10)
+            pc_c          *= scale
+            target_offsets *= scale
+
+            # 3. Random axis-aligned reflections (X and/or Y)
+            for axis in range(2):
+                if np.random.rand() < 0.5:
+                    pc_c[axis]           = -pc_c[axis]
+                    target_offsets[:, axis] = -target_offsets[:, axis]
+
+            # 4. Point dropout — randomly zero-out up to 10 % of points
+            if np.random.rand() < 0.5:
+                drop_n = np.random.randint(1, max(2, self.num_points // 10))
+                drop_idx = np.random.choice(self.num_points, drop_n, replace=False)
+                pc_c[:, drop_idx]  = 0.0
+                rgb_pts[:, drop_idx] = 0.0
+
+            # 5. Gaussian noise on XYZ (slightly stronger than before)
+            pc_c += np.random.randn(*pc_c.shape).astype(np.float32) * 0.003
+
+            # 6. Colour jitter on RGB channels
+            #    Independent brightness/contrast per channel
+            for c in range(3):
+                alpha = np.random.uniform(0.8, 1.2)   # contrast
+                beta  = np.random.uniform(-0.05, 0.05) # brightness
+                rgb_pts[c] = np.clip(alpha * rgb_pts[c] + beta, 0.0, 1.0)
+
+        # ── assemble feature tensor (6, N) ────────────────────────────────
+        features = np.concatenate([pc_c, rgb_pts], axis=0).astype(np.float32)
 
         return {
-            'points': torch.from_numpy(features),  # (6, 1024)
-            'target': torch.from_numpy(target_offsets.flatten())  # (24,)
+            "points": torch.from_numpy(features),              # (6, 1024)
+            "target": torch.from_numpy(target_offsets.flatten().astype(np.float32)),  # (24,)
         }

@@ -1,11 +1,14 @@
-3D Bounding Box Prediction Pipeline
+# 3D Bounding Box Prediction Pipeline
 
-This project implements a state-of-the-art deep learning pipeline for 3D bounding box prediction from RGB-D data and instance segmentation masks. The solution focuses on structural rigidity, translation invariance, and solving the notorious partial observability problem in top-down point clouds.
+This project implements a state-of-the-art deep learning pipeline for 3D bounding box prediction from RGB-D data and instance segmentation masks. The solution focuses on structural rigidity, translation, and rotation invariance to guarantee accurate and mathematically valid 3D bounding boxes.
 
-1. Pipeline Visualisation
+---
 
-The following diagram illustrates the complete end-to-end data flow, from raw inputs to the final rigid 3D Bounding Box.
+## 1. Pipeline Visualization
 
+The following diagram illustrates the complete end-to-end data flow, from raw inputs to the final rigid 3D bounding box:
+
+```
 ┌─────────────────┐   ┌─────────────┐   ┌───────────────┐
 │ RGB Image (H,W) │   │ Point Cloud │   │ Instance Mask │
 └────────┬────────┘   └──────┬──────┘   └───────┬───────┘
@@ -13,9 +16,9 @@ The following diagram illustrates the complete end-to-end data flow, from raw in
          └───────────────────┼──────────────────┘
                              ▼
                [ 1. Contextual Sampler ] 
-       Samples 512 points inside the mask (Object)
+     Samples 512 points inside the mask (Object)
      Samples 512 points outside the mask (Background)
-       Appends Mask as a 7th Channel (1=Obj, 0=BG)
+     Appends Mask as a 7th Channel (1 = Obj, 0 = BG)
                              │
                              ▼
                    Tensor: (7, 1024)
@@ -40,95 +43,97 @@ The following diagram illustrates the complete end-to-end data flow, from raw in
            [ 3. Deterministic Box Constructor ]
         Applies Gram-Schmidt Orthogonalization to 
         the 6D vector to generate a perfect 3x3 
-        rotation matrix. Combines with Center and Dims.
+        rotation matrix. Combines with center and dims.
                              │
                              ▼
          ┌──────────────────────────────────────┐
-         │ Flawless, Rigid 3D Bounding Box (8x3)│
+         │  Flawless, Rigid 3D Bounding Box    │
+         │        (Shape: 8×3)                 │
          └──────────────────────────────────────┘
+```
 
+---
 
-2. Design Choices & Reasoning
+## 2. Design Choices & Reasoning
 
-A. Point-Based Processing over 2D Projection (CenterNet)
+### A. Point-Based Processing over 2D Projection (CenterNet)
 
-Initial Approach: Originally, a 2D CenterNet-style approach was considered.
+- **Initial Approach:** A 2D CenterNet-style method using RGB images.
+- **Reason for Change:** 2D CNNs distort spatial information when projecting 3D data; objects appear differently based on lens position, introducing geometric inconsistencies.
+- **Final Choice:** Operate directly on the 3D point cloud. This preserves real-world metric scale (1 unit = 1 meter) and enables true geometric reasoning.
 
-Reason for Change: 2D CNNs suffer from spatial distortion when projecting 3D data. A car on the left side of the lens looks different than one on the right.
+### B. DGCNN over Standard PointNet
 
-Final Choice: Operating directly on the 3D Point Cloud natively respects the metric scale (1 unit = 1 meter) and allows true geometric reasoning without perspective distortion.
+- **Problem:** PointNet processes every point independently—good for shape, bad for details. It cannot distinguish flat walls from sharp corners.
+- **Solution:** DGCNN builds a dynamic graph of point neighborhoods, capturing local geometric features (like corners) by analyzing point relationships.
 
-B. DGCNN over Standard PointNet
+### C. Contextual Sampling for "Invisible Z-Height"
 
-Problem: A standard PointNet processes every point independently. It understands the "global silhouette" of an object but cannot distinguish between a flat wall and a sharp corner.
+- **Problem (Partial Observability):** A top-down camera sees only the top face (e.g., birdhouse roof)—the base is hidden, which leads to Z-height ambiguity.
+- **Solution:** Extract both object (512) and background (512) points. A 7th binary mask channel distinguishes object/background, allowing the network to learn object-ground separation and Z-inference.
 
-Solution: We upgraded to a Dynamic Graph CNN (DGCNN). DGCNN explicitly calculates the distance between neighboring points to build a graph. By analyzing (neighbor - center), the network learns structural topology, enabling millimeter-precision bounds around the object's physical edges.
+### D. Structural Rigidity via 6D Pose Regression
 
-C. Contextual Sampling for "Invisible Z-Height"
+- **Problem:** Traditional networks predict 8 independent corners (24 values), resulting in non-cuboidal and warped outputs due to uncontrolled jitter.
+- **Solution:** Regress only 12 parameters: center (3), size (3), rotation (6). Gram-Schmidt orthogonalization guarantees a mathematically perfect 90-degree cuboid.
 
-Problem (Partial Observability): A top-down depth camera only sees the top face of an object (e.g., the roof of a birdhouse). The network has no idea where the bottom of the object is, causing massive errors in Z-axis positioning and height.
+---
 
-Solution: We extract 512 background points (the floor/table) alongside the 512 object points. We feed this (7, 1024) tensor into the network, where the 7th channel acts as a binary mask (1 for object, 0 for background). By allowing the network to "see" the floor beneath the object, it mathematically infers the occluded height.
+## 3. Loss Function Formulation
 
-D. Structural Rigidity via 6D Pose Regression
+Structural rigidity guarantees simplify losses; these focus only on placement:
 
-Problem: Standard 3D networks predict 8 independent corners (24 values). Independent jitter causes these points to tangle into non-cuboid, warped diamonds.
+**Chamfer Distance Loss (Order-Agnostic):**
+- Intuition: Two perfect cuboids, even if rotated 180°, are identical in shape. Chamfer distance ignores corner order, measuring closest-point distances only.
 
-Solution: The network explicitly regresses 12 parameters: Center (3), Size (3), and Rotation (6). Gram-Schmidt orthogonalization guarantees that the output is always a mathematically perfect 90-degree right-angled cuboid.
+**Hungarian L1 Loss (Fine-Tuning):**
+- Uses the Hungarian matching algorithm to optimally pair predicted and ground-truth corners, then applies robust L1 loss on pairs.
 
-3. Loss Function Formulation
+**Anchor Center L1 Loss:**
+- Directly regularizes the predicted center to match the ground-truth geometric median, ensuring tight box-point cloud anchoring.
 
-Because we guarantee structural rigidity inside the network, our loss functions only need to optimize the physical placement of the box.
+---
 
-Chamfer Distance Loss (Order-Agnostic)
+## 4. Evaluation Metrics
 
-Intuition: If a perfect box is rotated 180 degrees, it visually looks identical, but the corner indices (0 and 5) have swapped. Standard L1 loss heavily penalizes this, causing the network to panic and output tiny 3cm boxes ("mean collapse").
+- **MCD (Mean/Median Corner Distance):** Average L2 distance (meters) between predicted and ground-truth corners. Best: ~4.5–5.2 cm.
+- **Recall @ 10cm / 5cm:** Percentage of objects where error is below threshold (e.g., >90% recall at 10 cm).
+- **Z-Occlusion Metrics:** Explicitly tracks mean Z-height error to measure how well contextual sampling overcomes visibility limitations.
 
-Formula: Chamfer Distance measures the nearest-neighbor distance between the predicted corner cloud and the ground truth corner cloud, completely ignoring topological ordering.
+---
 
-Hungarian L1 Loss (Fine-Tuning)
+## 5. Getting Started & Execution
 
-Intuition: We use the Hungarian matching algorithm (scipy.optimize.linear_sum_assignment) to dynamically find the optimal bipartite pairing between the predicted corners and GT corners, then apply a Smooth L1 loss to lock them in.
+### 1. Training the DGCNN Model
 
-Anchor Center L1 Loss
-
-Intuition: A direct regularization term forcing the predicted Center Offset to match the ground truth geometric median, keeping the bounding box firmly anchored to the point cloud mass.
-
-4. Evaluation Metrics
-
-Performance is measured on a held-out test split (10% of the dataset) using strict physical metrics:
-
-MCD (Mean/Median Corner Distance): The average L2 distance (in meters) between the predicted corners and the ground truth. Current Best: ~4.5 - 5.2 cm.
-
-Recall @ 10cm / 5cm: The percentage of predictions where the average error is below a specific threshold (e.g., >90% recall at 10cm).
-
-Z-Occlusion Metrics: Explicit tracking of the Mean Z-Height Error to measure how successfully the contextual sampling overcomes top-down partial observability.
-
-5. Getting Started & Execution
-
-1. Training the DGCNN Model
-
-Trains the model from scratch using the 7-channel Contextual Sampling dataset.
-
+Train from scratch using the 7-channel contextual sampling dataset:
+```bash
 python train.py --data_root /path/to/dataset --epochs 80 --batch_size 16 --in_channels 7
+```
 
+### 2. Testing & Evaluation
 
-2. Testing & Evaluation
-
-Evaluates the model on the unseen test set, calculates Hungarian MCD, and isolates the worst-performing predictions (errors > 10cm) for failure analysis.
-
+Evaluate on the test set (calculates Hungarian MCD, isolates failures):
+```bash
 python test.py --data_root /path/to/dataset --checkpoint best_model.pth --vis_dir test_output
+```
 
+### 3. Interactive Visualization (Inference)
 
-3. Interactive Visualization (Inference)
-
-Generates fully interactive 3D Plotly HTML files. Open the output files in any web browser to pan, zoom, and rotate around the predicted rigid boxes and raw point clouds.
-
+Generate fully interactive 3D Plotly HTML visualizations:
+```bash
 python inference.py --data_root /path/to/dataset --checkpoint best_model.pth --out_dir output
+```
+Open output HTML files in your browser for pan, zoom, and 3D inspection.
 
+### 4. High-Throughput Deployment (ONNX)
 
-4. High-Throughput Deployment (ONNX)
-
-Exports the PyTorch graph to a universally deployable FP32 ONNX model (opset 18), ready for TensorRT or ONNXRuntime ingestion.
-
+Export the PyTorch model to ONNX for deployment:
+```bash
 python export_onnx.py --checkpoint best_model.pth --out_dir onnx_export
+```
+Ready for TensorRT or ONNXRuntime inference.
+
+---
+
+Feel free to reach out with questions or to contribute!

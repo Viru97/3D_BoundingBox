@@ -1,17 +1,28 @@
 # Sereact 3D Bounding Box Prediction (DGCNNBBox)
 
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![CI](https://github.com/Viru97/3D_BoundingBox/actions/workflows/ci.yml/badge.svg?branch=v3)](https://github.com/Viru97/3D_BoundingBox/actions/workflows/ci.yml?query=branch%3Av3)
+[![Docker](https://img.shields.io/badge/Docker-reference%20image-2496ED?logo=docker&logoColor=white)](Dockerfile)
+[![ONNX](https://img.shields.io/badge/ONNX-export-005CED?logo=onnx&logoColor=white)](scripts/export_onnx.py)
+[![Status](https://img.shields.io/badge/status-research%20baseline-F59E0B)](docs/production-readiness.md)
+
 This project implements a staged, accuracy-focused pipeline for 3D bounding box prediction from RGB-D data and instance segmentation masks. The current rebuild focuses on truthful evaluation, shared preprocessing, structural rigidity, and better handling of partial observability in top-down point clouds.
 
 **Technical Assumption:** Mask-based inference remains the primary path via `mask.npy`, but the package now exposes a `MaskProvider` interface so a detector or segmenter can be added without rewriting the 3D box pipeline.
+
+**Project Status:** Integration-ready research baseline. The repository is reproducible and packaged for development, evaluation, and export. The current checkpoint is not approved for production accuracy requirements. See [`docs/production-readiness.md`](docs/production-readiness.md).
 
 ---
 
 ## 🌟 Key Features
 
 * **Modular Package Architecture:** Cleanly separated package structure (`src/sereact_3d_bbox`) with standalone execution scripts.
+* **Dataset Preflight:** Validates every scene and mask before a long training run begins.
 * **Shared Preprocessing Contract (10-Channels):** Samples aligned object/background XYZ and RGB, mask identity, height above floor, radial distance, and floor-contact context.
 * **Robust Preprocessing:** Validates sample shapes, rejects bad masks explicitly, and uses Median Absolute Deviation (MAD) filtering for depth bleeding and mask leakage.
 * **Group-Disjoint Splits:** Saves a deterministic split manifest so train/validation/test never share scene folders.
+* **Resumable Training:** Writes atomic best and latest checkpoints with optimizer, scaler, configuration, and split metadata.
 * **Continuous 6D Rotation:** Utilizes Gram-Schmidt orthogonalization (Zhou et al. 2019) to ensure valid, continuous SO(3) box rotation matrices without gimbal lock.
 * **DGCNNBBoxV2 Baseline:** Adds cleaner heads, stable dimension decoding, direct center/dimension supervision, and cuboid-symmetry-aware pose loss.
 * **Export with Parity Checks:** Exports FP32 and optional INT8 ONNX graphs and verifies PyTorch/ONNX output parity.
@@ -102,45 +113,52 @@ python scripts/test.py \
 
 ## 🛠️ Installation & Configuration
 
-### 🐳 Docker (Recommended)
-This project includes a fully portable, headless Docker container that natively handles all complex system dependencies (like OpenCV and PyTorch) without requiring local GPU driver configurations.
-
-```bash
-# 1. Build the Docker image
-docker build -t sereact_3d_bbox .
-
-# 2. Run the container interactively (Mount your dataset and outputs)
-# Replace /path/to/dataset with your actual dataset path
-docker run -it --rm \
-    -v /path/to/dataset:/app/dataset \
-    -v $(pwd)/output:/app/output \
-    -v $(pwd)/best_model.pth:/app/best_model.pth \
-    sereact_3d_bbox
-```
-*Once inside the container, you can run any of the execution scripts below directly.*
-
 ### 💻 Local Virtual Environment
-If you prefer not to use Docker, we recommend using a virtual environment (e.g., `venv` or `conda`). You can set this up after extracting the `.zip` file or cloning the repo.
+
+Python `3.10+` is supported. A local environment is the recommended setup for training and GPU use.
 
 ```bash
-# If using the zip file: unzip sereact_project.zip && cd sereact_project
-# Or, if using git: git clone https://github.com/your-username/sereact_3d_bbox.git && cd sereact_3d_bbox
-
-# Create and activate a virtual environment
+git clone https://github.com/Viru97/3D_BoundingBox.git
+cd 3D_BoundingBox
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Install the project and dependencies in editable mode
-pip install -e .
-
-# Optional: install test tooling
-pip install -e ".[dev]"
+python -m pip install -e ".[all]"
+cp paths.example.json paths.local.json
 ```
 
-### Configuration:
-All core hyperparameters, thresholds, and data settings (like `num_points`) are centralized in `src/sereact_3d_bbox/config.py`. The execution scripts automatically pull defaults from this file, allowing you to globally modify parameters in one place.
+Use `python -m pip install -e ".[dev]"` or `make install-dev` when contributing.
+
+### 🐳 Docker
+
+The included Dockerfile is a non-root CPU reference image for reproducible inference and export. GPU deployment requires an environment compatible with your NVIDIA driver and CUDA runtime.
+
+```bash
+docker build -t sereact_3d_bbox .
+docker run --rm \
+    -v /path/to/dataset:/data:ro \
+    -v "$(pwd)/best_model.pth:/models/best_model.pth:ro" \
+    -v "$(pwd)/output_visualizations:/app/output_visualizations" \
+    sereact_3d_bbox \
+    python scripts/inference.py \
+    --data_root /data \
+    --weights /models/best_model.pth
+```
+
+### Configuration
+
+Core hyperparameters and thresholds live in `src/sereact_3d_bbox/config.py`.
 
 Local filesystem paths live in `paths.local.json`. This file is ignored by git, so you can put machine-specific dataset/checkpoint/output paths there. `paths.example.json` shows the expected keys. Every script reads `paths.local.json` by default, and you can override it with `--paths_file /path/to/other_paths.json`.
+
+Each dataset scene folder must contain:
+
+```text
+scene-id/
+├── rgb.jpg       # (H, W, 3)
+├── pc.npy        # (3, H, W) or (H, W, 3)
+├── mask.npy      # (N, H, W) or (H, W)
+└── bbox3d.npy    # (N, 8, 3) or (N, 24), required for training/evaluation
+```
 
 ---
 
@@ -148,7 +166,17 @@ Local filesystem paths live in `paths.local.json`. This file is ignored by git, 
 
 All executable entry-points are located inside the `scripts/` directory.
 
-### 1. Training
+### 1. Dataset Preflight
+
+Validate all scenes and masks before training:
+
+```bash
+python scripts/validate_dataset.py
+```
+
+Use `--strict` in controlled pipelines to fail when any instance is skipped.
+
+### 2. Training
 Trains the network using Cosine LR scheduling, AMP (Automatic Mixed Precision), and our advanced composite loss.
 ```bash
 python scripts/train.py \
@@ -159,7 +187,13 @@ python scripts/train.py \
 ```
 If `data_root` and `split_manifest` are set in `paths.local.json`, they do not need to be repeated on the command line. If the split manifest does not exist, training creates one using deterministic group-disjoint scene splits.
 
-### 2. Evaluation
+Training writes the best validation checkpoint and an atomic `*_last.pth` checkpoint after every epoch. Resume an interrupted run with:
+
+```bash
+python scripts/train.py --resume best_model_last.pth
+```
+
+### 3. Evaluation
 Evaluates the model on the held-out test split, plots MCD (Mean Corner Distance) histograms, computes `Recall @ Thresholds`, and renders static PNG plots of the worst failure cases.
 ```bash
 python scripts/test.py \
@@ -167,7 +201,7 @@ python scripts/test.py \
 ```
 This also reads `data_root`, `split_manifest`, and `test_output_dir` from `paths.local.json` when present.
 
-### 3. Interactive Inference
+### 4. Interactive Inference
 Runs inference on a specific sample or entire dataset. Outputs interactive 3D **Plotly HTML** files with Ground Truth and Predictions seamlessly overlaid.
 ```bash
 python scripts/inference.py \
@@ -175,14 +209,24 @@ python scripts/inference.py \
 ```
 Missing weights now fail loudly. Use `--allow_random_weights` only for smoke tests.
 
-### 4. ONNX & INT8 Export
-Exports the model to ONNX using Opsets=18 and generates a dynamically quantized INT8 model roughly 4x smaller.
+### 5. ONNX & INT8 Export
+Exports the model to ONNX using Opset 18, verifies PyTorch/ONNX parity, and optionally generates a dynamically quantized INT8 model.
 ```bash
 python scripts/export_onnx.py \
     --checkpoint best_model.pth
 ```
 The ONNX graph returns `center`, `log_dims`, `rot6d`, and decoded relative `corners`.
+INT8 is smaller but is not guaranteed to be faster on every target CPU. Benchmark both artifacts on deployment hardware.
 *(Once exported to ONNX, you can build TensorRT engines using `trtexec --onnx=onnx_export/dgcnn_bbox.onnx --fp16 --saveEngine=dgcnn_bbox.trt`)*
+
+### Task Shortcuts
+
+```bash
+make help
+make preflight
+make check
+make evaluate CHECKPOINT=best_model_pose.pth
+```
 
 ---
 
@@ -272,6 +316,9 @@ This section outlines the iterative engineering process used to solve the 3D Bou
 
 ```text
 sereact_3d_bbox/
+├── .github/workflows/ci.yml   # Lint, test, compile, and package-build CI
+├── CONTRIBUTING.md            # Contributor workflow
+├── Makefile                   # Common local tasks
 ├── pyproject.toml              # Build system and dependencies
 ├── paths.example.json          # Template for local paths
 ├── paths.local.json            # Your ignored local path file
@@ -280,6 +327,7 @@ sereact_3d_bbox/
 │   ├── train.py                # Main training loop
 │   ├── test.py                 # Evaluation & test metrics
 │   ├── inference.py            # Local inference & HTML plotting
+│   ├── validate_dataset.py      # Dataset preflight
 │   └── export_onnx.py          # Export to FP32 & INT8 ONNX
 ├── tests/                      # Synthetic unit and integration tests
 └── src/
@@ -294,6 +342,7 @@ sereact_3d_bbox/
         ├── inference.py        # Prediction dataclasses and MaskProvider API
         ├── metrics.py          # Cuboid matching, MCD, summaries
         ├── paths.py            # Loader for paths.local.json
+        ├── validation.py       # Dataset-wide preflight reports
         ├── models/
         │   ├── __init__.py
         │   ├── dgcnn.py        # DGCNNBBox and DGCNNBBoxV2
@@ -301,3 +350,9 @@ sereact_3d_bbox/
         └── utils/
             └── __init__.py
 ```
+
+---
+
+## License
+
+No redistribution license has been selected yet. Add an owner-approved `LICENSE` file before publishing this repository for third-party reuse.

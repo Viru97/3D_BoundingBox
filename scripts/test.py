@@ -115,6 +115,8 @@ def main(args):
     out_dir = Path(args.vis_dir)
     failures_dir = out_dir / "worst_failures"
     failures_dir.mkdir(parents=True, exist_ok=True)
+    for stale in failures_dir.glob("*.png"):
+        stale.unlink()
 
     all_mcd, all_dim_err, all_z_err, all_ang_err = [], [], [], []
     losses = []

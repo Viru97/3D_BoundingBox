@@ -5,6 +5,8 @@ __pycache__/
 *.so
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
 # Virtual environments
 .venv/
@@ -32,6 +34,7 @@ output_*/
 test_output/
 onnx_export/
 *.pth
+*.pth.tmp
 *.pt
 *.onnx
 *.onnx.data

@@ -20,6 +20,9 @@ from sereact_3d_bbox.models.loss import BBoxLoss
 from sereact_3d_bbox.paths import fill_missing_path_args, load_paths
 
 
+CHECKPOINT_FORMAT_VERSION = 1
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -42,6 +45,28 @@ def cosine_lr(optimizer, epoch, warmup, total, base_lr, min_lr):
     for group in optimizer.param_groups:
         group["lr"] = lr
     return lr
+
+
+def atomic_torch_save(payload, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+
+
+def checkpoint_payload(model, optimizer, scaler, epoch, best_mcd, args, manifest):
+    return {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict(),
+        "best_mcd": best_mcd,
+        "args": vars(args),
+        "config": asdict(cfg),
+        "split_manifest": manifest,
+    }
 
 
 def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None):
@@ -145,12 +170,15 @@ def main(args):
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"], strict=True)
         optimizer.load_state_dict(ckpt["optimizer"])
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
         start_epoch = int(ckpt.get("epoch", 0))
         best_mcd = float(ckpt.get("best_mcd", best_mcd))
         print(f"Resumed {args.resume} at epoch {start_epoch}")
 
     save_path = Path(args.save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    last_save_path = Path(args.last_save_path) if args.last_save_path else save_path.with_name(save_path.stem + "_last.pth")
     log_path = save_path.with_name(save_path.stem + "_log.csv")
     write_header = not log_path.exists() or start_epoch == 0
     with log_path.open("a", newline="", encoding="utf-8") as f:
@@ -200,19 +228,16 @@ def main(args):
 
         if val_med < best_mcd:
             best_mcd = val_med
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "best_mcd": best_mcd,
-                    "args": vars(args),
-                    "config": asdict(cfg),
-                    "split_manifest": manifest,
-                },
+            atomic_torch_save(
+                checkpoint_payload(model, optimizer, scaler, epoch + 1, best_mcd, args, manifest),
                 save_path,
             )
             print(f"  saved best median MCD {best_mcd:.4f} m -> {save_path}")
+        atomic_torch_save(
+            checkpoint_payload(model, optimizer, scaler, epoch + 1, best_mcd, args, manifest),
+            last_save_path,
+        )
+        print(f"  saved resumable checkpoint -> {last_save_path}")
 
 
 if __name__ == "__main__":
@@ -236,6 +261,7 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=cfg.train.seed)
     p.add_argument("--resume", default=cfg.train.resume)
     p.add_argument("--save_path", default=None)
+    p.add_argument("--last_save_path", default=None)
     p.add_argument("--chamfer_weight", type=float, default=cfg.train.chamfer_weight)
     p.add_argument("--corner_weight", type=float, default=cfg.train.corner_weight)
     p.add_argument("--center_weight", type=float, default=cfg.train.center_weight)

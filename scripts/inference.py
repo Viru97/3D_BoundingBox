@@ -21,7 +21,7 @@ def ensure_writable_output_dir(out_dir):
         probe = out_dir / ".write_test"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
-    except PermissionError as exc:
+    except OSError as exc:
         raise SystemExit(
             f"Cannot write to inference output directory: {out_dir}\n"
             "Choose a writable path in paths.local.json as inference_output_dir "
@@ -118,7 +118,11 @@ def main(args):
         samples = [Path(args.sample)]
     else:
         root = Path(args.data_root)
+        if not root.is_dir():
+            raise SystemExit(f"Dataset root is not a directory: {root}")
         samples = sorted(p for p in root.iterdir() if p.is_dir() and (p / "rgb.jpg").exists())
+    if not samples:
+        raise SystemExit("No samples found. Check --sample or data_root in paths.local.json.")
 
     for sample_dir in samples:
         run_sample(model, device, sample_dir, args.out_dir, args.num_points)

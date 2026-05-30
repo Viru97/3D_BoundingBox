@@ -6,6 +6,8 @@ ENV/
 
 # Python Cache
 __pycache__/
+.pytest_cache/
+.ruff_cache/
 *.py[cod]
 *$py.class
 *.so
@@ -26,8 +28,12 @@ onnx_export/
 dummy/
 paths.local.json
 *.pth
-best_model_log.csv
+*.pth.tmp
+*_log.csv
 *.onnx
+*.onnx.data
+build/
+dist/
 
 # Git
 .git/

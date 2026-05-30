@@ -113,8 +113,10 @@ class DGCNNBBox(nn.Module):
         self.fc_rot    = nn.Linear(256, 6)
 
         # Initialise to identity rotation and ~13 cm box
-        nn.init.zeros_(self.fc_center.weight); nn.init.zeros_(self.fc_center.bias)
-        nn.init.zeros_(self.fc_dims.weight);   self.fc_dims.bias.data.fill_(-2.0)
+        nn.init.zeros_(self.fc_center.weight)
+        nn.init.zeros_(self.fc_center.bias)
+        nn.init.zeros_(self.fc_dims.weight)
+        self.fc_dims.bias.data.fill_(-2.0)
         nn.init.zeros_(self.fc_rot.weight)
         self.fc_rot.bias.data = torch.tensor([1., 0., 0., 0., 1., 0.])
 

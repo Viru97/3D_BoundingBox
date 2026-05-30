@@ -4,7 +4,7 @@ model.py — DGCNNBBox
 Dynamic Graph CNN for 3D bounding box regression from point clouds.
 
 Architecture:
-  Input  : (B, 7, N)  — XYZ (centred) + RGB + binary object mask
+  Input  : (B, C, N)  — V1 uses 7 channels, V2 defaults to 10 context channels
   Output : center_offset (B,3), log_dims (B,3), rot6d (B,6)
 
 The model predicts box parameters relative to the point-cloud median anchor:
@@ -19,6 +19,8 @@ Memory fix: get_graph_feature uses the identity ‖a-b‖² = ‖a‖²+‖b‖�
 to avoid materialising the full (B,N,N) distance matrix. At B=32, N=1024
 this saves ~136 MB peak VRAM vs torch.cdist called 4× per forward pass.
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -39,6 +41,7 @@ def get_graph_feature(x, k=20):
     neg_dist2 = (2.0 * torch.bmm(x_t, x.contiguous())
                  - norm2
                  - norm2.transpose(1, 2))                     # (B, N, N)
+    k = min(k, N)
     idx = neg_dist2.topk(k=k, dim=-1, largest=True)[1]        # (B, N, k)
 
     idx_base = torch.arange(0, B, device=x.device).view(-1, 1, 1) * N
@@ -64,8 +67,27 @@ class EdgeConv(nn.Module):
         return self.conv(get_graph_feature(x, self.k)).max(dim=-1)[0]
 
 
+def rotation_6d_to_matrix(rot6d):
+    x = F.normalize(rot6d[:, :3], p=2, dim=1, eps=1e-6)
+    y = rot6d[:, 3:]
+    y = F.normalize(y - (x * y).sum(1, keepdim=True) * x, p=2, dim=1, eps=1e-6)
+    z = torch.cross(x, y, dim=1)
+    return torch.stack([x, y, z], dim=-1)
+
+
+def box_from_parameters(center, log_dims, rot6d):
+    dims = torch.exp(log_dims) / 2.0
+    unit = torch.tensor([
+        [-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],
+        [-1,-1, 1],[1,-1, 1],[1,1, 1],[-1,1, 1],
+    ], dtype=torch.float32, device=center.device)
+    corners = unit.unsqueeze(0) * dims.unsqueeze(1)
+    rotation = rotation_6d_to_matrix(rot6d)
+    return torch.bmm(corners, rotation.transpose(1, 2)) + center.unsqueeze(1)
+
+
 class DGCNNBBox(nn.Module):
-    def __init__(self, in_channels=7, k=20):
+    def __init__(self, in_channels=7, k=20, dropout=0.4):
         super().__init__()
         self.edge1 = EdgeConv(in_channels, 64,  k)
         self.edge2 = EdgeConv(64,          64,  k)
@@ -83,7 +105,7 @@ class DGCNNBBox(nn.Module):
         self.fc2  = nn.Linear(512,  256)
         self.bn1  = nn.BatchNorm1d(512)
         self.bn2  = nn.BatchNorm1d(256)
-        self.drop = nn.Dropout(p=0.4)
+        self.drop = nn.Dropout(p=dropout)
 
         # Disentangled output heads
         self.fc_center = nn.Linear(256, 3)
@@ -112,20 +134,67 @@ class DGCNNBBox(nn.Module):
 
     def get_3d_box(self, center, log_dims, rot6d):
         """Reconstruct 8 corners of the oriented 3D bounding box."""
-        B    = center.shape[0]
-        dims = torch.exp(log_dims) / 2.0
+        return box_from_parameters(center, log_dims, rot6d)
 
-        unit = torch.tensor([
-            [-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],
-            [-1,-1, 1],[1,-1, 1],[1,1, 1],[-1,1, 1],
-        ], dtype=torch.float32, device=center.device)
-        corners = unit.unsqueeze(0) * dims.unsqueeze(1)  # (B, 8, 3)
 
-        # Gram-Schmidt → valid SO(3) rotation matrix
-        x   = F.normalize(rot6d[:, :3], p=2, dim=1, eps=1e-6)
-        y   = rot6d[:, 3:]
-        y   = F.normalize(y - (x * y).sum(1, keepdim=True) * x, p=2, dim=1, eps=1e-6)
-        z   = torch.cross(x, y, dim=1)
-        R   = torch.stack([x, y, z], dim=-1)              # (B, 3, 3)
+class DGCNNBBoxV2(nn.Module):
+    def __init__(self, in_channels=10, k=20, dropout=0.30, min_dim=0.02, max_dim=3.0):
+        super().__init__()
+        self.min_dim = min_dim
+        self.max_dim = max_dim
+        self.edge1 = EdgeConv(in_channels, 64, k)
+        self.edge2 = EdgeConv(64, 96, k)
+        self.edge3 = EdgeConv(96, 160, k)
+        self.edge4 = EdgeConv(160, 256, k)
 
-        return torch.bmm(corners, R.transpose(1, 2)) + center.unsqueeze(1)
+        channels = 64 + 96 + 160 + 256
+        self.local_fuse = nn.Sequential(
+            nn.Conv1d(channels, 768, kernel_size=1, bias=False),
+            nn.BatchNorm1d(768),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(1536, 512, bias=False),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(negative_slope=0.2),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256, bias=False),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(negative_slope=0.2),
+            nn.Dropout(dropout),
+        )
+        self.fc_center = nn.Linear(256, 3)
+        self.fc_dims = nn.Linear(256, 3)
+        self.fc_rot = nn.Linear(256, 6)
+
+        nn.init.zeros_(self.fc_center.weight)
+        nn.init.zeros_(self.fc_center.bias)
+        nn.init.zeros_(self.fc_dims.weight)
+        init_dim = 0.15
+        raw = math.log(math.exp(max(init_dim - min_dim, 1e-4)) - 1.0)
+        self.fc_dims.bias.data.fill_(raw)
+        nn.init.zeros_(self.fc_rot.weight)
+        self.fc_rot.bias.data = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+
+    def forward(self, x):
+        x1 = self.edge1(x)
+        x2 = self.edge2(x1)
+        x3 = self.edge3(x2)
+        x4 = self.edge4(x3)
+        local = self.local_fuse(torch.cat([x1, x2, x3, x4], dim=1))
+        pooled = torch.cat([local.max(dim=2)[0], local.mean(dim=2)], dim=1)
+        latent = self.head(pooled)
+        dims = self.min_dim + F.softplus(self.fc_dims(latent))
+        dims = torch.clamp(dims, max=self.max_dim)
+        return self.fc_center(latent), torch.log(dims), self.fc_rot(latent)
+
+    def get_3d_box(self, center, log_dims, rot6d):
+        return box_from_parameters(center, log_dims, rot6d)
+
+
+def build_model(version="v2", in_channels=10, k=20, dropout=0.30):
+    if version == "v1":
+        return DGCNNBBox(in_channels=in_channels, k=k, dropout=dropout)
+    if version == "v2":
+        return DGCNNBBoxV2(in_channels=in_channels, k=k, dropout=dropout)
+    raise ValueError(f"Unknown model version '{version}'")

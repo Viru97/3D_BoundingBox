@@ -1,135 +1,139 @@
-import os, argparse
-import cv2, torch
+import argparse
+from pathlib import Path
+
 import numpy as np
 import plotly.graph_objects as go
+import torch
 
 from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.data.dataset import mad_filter, PointCloudInstanceDataset
-from sereact_3d_bbox.models.dgcnn import DGCNNBBox
+from sereact_3d_bbox.data.preprocessing import load_sample
+from sereact_3d_bbox.inference import NpyMaskProvider, load_model, predict_sample
+from sereact_3d_bbox.paths import fill_missing_path_args, load_paths
 
-EDGES = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
+
+EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+
+
+def ensure_writable_output_dir(out_dir):
+    out_dir = Path(out_dir)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        probe = out_dir / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except PermissionError as exc:
+        raise SystemExit(
+            f"Cannot write to inference output directory: {out_dir}\n"
+            "Choose a writable path in paths.local.json as inference_output_dir "
+            "or pass --out_dir /path/you/can/write."
+        ) from exc
+    return out_dir
+
 
 def add_box(fig, corners, color, name):
-    xl, yl, zl = [], [], []
+    xs, ys, zs = [], [], []
     for i, j in EDGES:
-        xl += [corners[i,0], corners[j,0], None]
-        yl += [corners[i,1], corners[j,1], None]
-        zl += [corners[i,2], corners[j,2], None]
-    fig.add_trace(go.Scatter3d(x=xl, y=yl, z=zl, mode="lines",
-                               line=dict(color=color, width=4), name=name))
+        xs += [corners[i, 0], corners[j, 0], None]
+        ys += [corners[i, 1], corners[j, 1], None]
+        zs += [corners[i, 2], corners[j, 2], None]
+    fig.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode="lines", line=dict(color=color, width=4), name=name))
 
-def preprocess(pc, img_rgb, mask, num_points):
-    """Identical to dataset.__getitem__ preprocessing (no augmentation)."""
-    obj_y, obj_x = np.where(mask);    bg_y, bg_x = np.where(~mask)
-    if len(obj_y) == 0: return None, None
 
-    pc_obj  = pc[:, obj_y, obj_x]
-    rgb_obj = img_rgb[obj_y, obj_x].astype(np.float32).T / 255.0
-    pc_bg   = pc[:, bg_y,  bg_x]
-    rgb_bg  = img_rgb[bg_y,  bg_x].astype(np.float32).T / 255.0
+def point_cloud_trace(sample):
+    pc = sample.point_cloud.reshape(3, -1)
+    pc = pc[:, np.isfinite(pc).all(axis=0) & (pc[2] > cfg.data.depth_threshold)]
+    if pc.shape[1] == 0:
+        return None
+    med = np.median(pc, axis=1, keepdims=True)
+    mad = np.median(np.abs(pc - med), axis=1, keepdims=True) + 1e-6
+    inlier = np.all(np.abs(pc - med) < cfg.data.mad_threshold * mad, axis=0)
+    if int(inlier.sum()) > 50:
+        pc = pc[:, inlier]
+    rng = np.random.default_rng(42)
+    count = max(1, min(pc.shape[1], pc.shape[1] // 100))
+    pc = pc[:, rng.choice(pc.shape[1], count, replace=False)]
+    return go.Scatter3d(
+        x=pc[0],
+        y=pc[1],
+        z=pc[2],
+        mode="markers",
+        marker=dict(size=1.5, color=pc[2], colorscale="Viridis", opacity=0.5),
+        name="Point Cloud",
+    )
 
-    v = pc_obj[2] > 0.01;  pc_obj,  rgb_obj = pc_obj[:, v],  rgb_obj[:, v]
-    v = pc_bg[2]  > 0.01;  pc_bg,   rgb_bg  = pc_bg[:, v],   rgb_bg[:, v]
-    pc_obj, rgb_obj = mad_filter(pc_obj, rgb_obj)
 
-    anchor = np.median(pc_obj, axis=1) if pc_obj.shape[1] > 0 else np.zeros(3, dtype=np.float32)
-
-    n_obj, n_bg = num_points // 2, num_points - num_points // 2
-    N_obj, N_bg = pc_obj.shape[1], pc_bg.shape[1]
-
-    rng  = np.random.default_rng(42)
-    pc_obj  = pc_obj[:,  rng.choice(N_obj, n_obj, replace=(N_obj < n_obj))] if N_obj > 0 \
-              else np.zeros((3, n_obj), dtype=np.float32)
-    rgb_obj = rgb_obj[:, rng.choice(N_obj, n_obj, replace=(N_obj < n_obj))] if N_obj > 0 \
-              else np.zeros((3, n_obj), dtype=np.float32)
-    pc_bg   = pc_bg[:,   rng.choice(N_bg,  n_bg,  replace=(N_bg  < n_bg))]  if N_bg  > 0 \
-              else np.zeros((3, n_bg),  dtype=np.float32)
-    rgb_bg  = rgb_bg[:,  rng.choice(N_bg,  n_bg,  replace=(N_bg  < n_bg))]  if N_bg  > 0 \
-              else np.zeros((3, n_bg),  dtype=np.float32)
-
-    pc_c   = np.concatenate([pc_obj, pc_bg],  axis=1) - anchor[:, None]
-    rgb_c  = np.concatenate([rgb_obj, rgb_bg], axis=1)
-    msk    = np.concatenate([np.ones((1,n_obj),dtype=np.float32),
-                              np.zeros((1,n_bg), dtype=np.float32)], axis=1)
-    return np.concatenate([pc_c, rgb_c, msk], axis=0), anchor
-
-def run_sample(model, device, sample_dir, out_dir, idx, total, num_points):
-    img_bgr = cv2.imread(os.path.join(sample_dir, "rgb.jpg"))
-    if img_bgr is None: return
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pc      = np.load(os.path.join(sample_dir, "pc.npy"),
-                      allow_pickle=True).astype(np.float32)
-    masks   = np.load(os.path.join(sample_dir, "mask.npy"), allow_pickle=True)
-    folder  = os.path.basename(sample_dir.rstrip("/"))
-    print(f"\n[{idx}/{total}] {folder} — {len(masks)} object(s)")
-
-    predicted = []
-    for i, mask in enumerate(masks):
-        feat, anchor = preprocess(pc, img_rgb, mask, num_points)
-        if feat is None: continue
-        inp = torch.from_numpy(feat).unsqueeze(0).to(device)
-        with torch.no_grad():
-            center, log_dims, rot6d = model(inp)
-            pred_c = model.get_3d_box(center, log_dims, rot6d)
-        corners_abs = pred_c[0].cpu().numpy() + anchor
-        predicted.append(corners_abs)
-        dims = torch.exp(log_dims[0]).cpu().numpy()
-        print(f"  Obj {i+1}: {dims[0]:.3f}m × {dims[1]:.3f}m × {dims[2]:.3f}m")
-
-    pc_flat = pc.reshape(3, -1);  pc_vis = pc_flat[:, pc_flat[2] > 0.01]
-    med = np.median(pc_vis, axis=1, keepdims=True)
-    mad = np.median(np.abs(pc_vis - med), axis=1, keepdims=True) + 1e-6
-    inlier = np.all(np.abs(pc_vis - med) < 5.0 * mad, axis=0)
-    if inlier.sum() > 50: pc_vis = pc_vis[:, inlier]
-    sub    = np.random.choice(pc_vis.shape[1], max(1, pc_vis.shape[1]//100), replace=False)
-    pc_sub = pc_vis[:, sub]
+def run_sample(model, device, sample_dir, out_dir, num_points):
+    sample = load_sample(sample_dir, require_bboxes=False)
+    predictions = predict_sample(model, device, sample_dir, NpyMaskProvider(), num_points=num_points)
+    print(f"{sample.scene_id}: {len(predictions)} prediction(s)")
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter3d(x=pc_sub[0], y=pc_sub[1], z=pc_sub[2], mode="markers",
-                               marker=dict(size=1.5, color=pc_sub[2],
-                                           colorscale="Viridis", opacity=0.5),
-                               name="Point Cloud"))
-    for i, box in enumerate(predicted):
-        add_box(fig, box, "red", f"Pred {i+1}")
-    gt_path = os.path.join(sample_dir, "bbox3d.npy")
-    if os.path.exists(gt_path):
-        for i, box in enumerate(np.load(gt_path, allow_pickle=True)):
-            add_box(fig, box, "green", f"GT {i+1}")
+    trace = point_cloud_trace(sample)
+    if trace is not None:
+        fig.add_trace(trace)
+    for i, prediction in enumerate(predictions, start=1):
+        add_box(fig, prediction.corners, "red", f"Pred {i}")
+        dims = prediction.dims
+        print(f"  Obj {i}: {dims[0]:.3f}m x {dims[1]:.3f}m x {dims[2]:.3f}m")
+    if sample.bboxes is not None:
+        for i, box in enumerate(sample.bboxes, start=1):
+            add_box(fig, box, "green", f"GT {i}")
 
-    fig.update_layout(title=f"3D Bounding Boxes: {folder}",
-                      scene=dict(aspectmode="data"),
-                      margin=dict(l=0, r=0, b=0, t=40))
-    out = os.path.join(out_dir, f"{folder}_interactive.html")
-    fig.write_html(out)
-    print(f"  Saved: {out}")
+    fig.update_layout(
+        title=f"3D Bounding Boxes: {sample.scene_id}",
+        scene=dict(aspectmode="data"),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+    out_path = Path(out_dir) / f"{sample.scene_id}_interactive.html"
+    fig.write_html(out_path)
+    print(f"  Saved: {out_path}")
+
 
 def main(args):
+    explicit_sample = args.sample is not None
+    explicit_data_root = args.data_root is not None
+    paths = load_paths(args.paths_file)
+    fill_missing_path_args(args, paths)
+    if explicit_sample and not explicit_data_root:
+        args.data_root = None
+    if args.sample and args.data_root:
+        raise SystemExit("Use either --sample or --data_root, not both.")
+    if not args.sample and not args.data_root:
+        raise SystemExit("Set data_root or sample in paths.local.json, or pass --sample/--data_root.")
+    args.weights = args.weights or cfg.inference.weights
+    args.out_dir = args.out_dir or cfg.inference.out_dir
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = DGCNNBBox(in_channels=7).to(device)
-    if os.path.exists(args.weights):
-        ckpt  = torch.load(args.weights, map_location=device)
-        state = {k.replace("_orig_mod.", ""): v
-                 for k, v in ckpt.get("model", ckpt).items()}
-        model.load_state_dict(state, strict=False)
-        print(f"Loaded: {args.weights}")
-    model.eval()
-    os.makedirs(args.out_dir, exist_ok=True)
+    model, kwargs = load_model(
+        args.weights,
+        device,
+        allow_random_weights=args.allow_random_weights,
+        model_version=args.model_version,
+        in_channels=args.in_channels,
+    )
+    print(f"Loaded model: {kwargs}")
+    args.out_dir = ensure_writable_output_dir(args.out_dir)
 
-    samples = ([args.sample] if args.sample else sorted(
-        p for p in (os.path.join(args.data_root, d)
-                    for d in os.listdir(args.data_root))
-        if os.path.isdir(p) and os.path.exists(os.path.join(p, "rgb.jpg"))))
+    if args.sample:
+        samples = [Path(args.sample)]
+    else:
+        root = Path(args.data_root)
+        samples = sorted(p for p in root.iterdir() if p.is_dir() and (p / "rgb.jpg").exists())
 
-    for i, sd in enumerate(samples, 1):
-        run_sample(model, device, sd, args.out_dir, i, len(samples),
-                   args.num_points)
+    for sample_dir in samples:
+        run_sample(model, device, sample_dir, args.out_dir, args.num_points)
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--weights",    default=cfg.inference.weights)
-    p.add_argument("--out_dir",    default=cfg.inference.out_dir)
+    p.add_argument("--paths_file", default=None)
+    p.add_argument("--weights", default=None)
+    p.add_argument("--out_dir", default=None)
     p.add_argument("--num_points", type=int, default=cfg.data.num_points)
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--sample",    type=str)
-    g.add_argument("--data_root", type=str)
+    p.add_argument("--model_version", choices=["v1", "v2"], default=None)
+    p.add_argument("--in_channels", type=int, default=None)
+    p.add_argument("--allow_random_weights", action="store_true")
+    group = p.add_mutually_exclusive_group(required=False)
+    group.add_argument("--sample", type=str)
+    group.add_argument("--data_root", type=str)
     main(p.parse_args())

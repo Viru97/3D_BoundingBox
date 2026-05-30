@@ -1,0 +1,10 @@
+{
+  "data_root": "/absolute/path/to/dataset",
+  "split_manifest": "/absolute/path/to/dataset/splits.json",
+  "checkpoint": "best_model.pth",
+  "train_save_path": "best_model.pth",
+  "test_output_dir": "test_output",
+  "inference_output_dir": "output_visualizations",
+  "onnx_output_dir": "onnx_export",
+  "sample": ""
+}

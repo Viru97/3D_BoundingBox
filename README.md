@@ -1,18 +1,20 @@
 # Sereact 3D Bounding Box Prediction (DGCNNBBox)
 
-This project implements a state-of-the-art, modular, and production-ready deep learning pipeline for 3D bounding box prediction from RGB-D data and instance segmentation masks. The solution focuses on structural rigidity, translation invariance, and solving the notorious partial observability problem in top-down point clouds.
+This project implements a staged, accuracy-focused pipeline for 3D bounding box prediction from RGB-D data and instance segmentation masks. The current rebuild focuses on truthful evaluation, shared preprocessing, structural rigidity, and better handling of partial observability in top-down point clouds.
 
-**Technical Assumption:** We took the liberty to assume that instance segmentation masks (`mask.npy`) are readily available during inference. Decoupling the object localization/segmentation from the 3D bounding box regression allows the pipeline to fully leverage Contextual Sampling without relying on a bulky, parallel 2D segmentation head.
+**Technical Assumption:** Mask-based inference remains the primary path via `mask.npy`, but the package now exposes a `MaskProvider` interface so a detector or segmenter can be added without rewriting the 3D box pipeline.
 
 ---
 
 ## 🌟 Key Features
 
 * **Modular Package Architecture:** Cleanly separated package structure (`src/sereact_3d_bbox`) with standalone execution scripts.
-* **Context-Aware Sensing (7-Channels):** Samples both the object geometry and surrounding background context (XYZ + RGB + Mask) to counter partial occlusions (e.g., inferring the floor).
-* **Robust Preprocessing:** Incorporates Median Absolute Deviation (MAD) filtering to gracefully handle depth-sensor bleeding and mask leakage.
+* **Shared Preprocessing Contract (10-Channels):** Samples aligned object/background XYZ and RGB, mask identity, height above floor, radial distance, and floor-contact context.
+* **Robust Preprocessing:** Validates sample shapes, rejects bad masks explicitly, and uses Median Absolute Deviation (MAD) filtering for depth bleeding and mask leakage.
+* **Group-Disjoint Splits:** Saves a deterministic split manifest so train/validation/test never share scene folders.
 * **Continuous 6D Rotation:** Utilizes Gram-Schmidt orthogonalization (Zhou et al. 2019) to ensure valid, continuous SO(3) box rotation matrices without gimbal lock.
-* **Production Ready Export:** Includes a pipeline to export to FP32 & INT8 Quantized ONNX graphs with sub-millisecond CPU/GPU latencies.
+* **DGCNNBBoxV2 Baseline:** Adds cleaner heads, stable dimension decoding, direct center/dimension supervision, and cuboid-symmetry-aware pose loss.
+* **Export with Parity Checks:** Exports FP32 and optional INT8 ONNX graphs and verifies PyTorch/ONNX output parity.
 
 ---
 
@@ -30,11 +32,11 @@ The following diagram illustrates the complete end-to-end data flow, from raw in
                [ 1. Contextual Sampler ] 
        Samples 512 points inside the mask (Object)
      Samples 512 points outside the mask (Background)
-       Appends Mask as a 7th Channel (1=Obj, 0=BG)
+       Appends mask and floor/context channels
                              │
                              ▼
-                   Tensor: (7, 1024)
-            [ X, Y, Z, R, G, B, Binary_Mask ]
+                   Tensor: (10, 1024)
+ [ X,Y,Z, R,G,B, Mask, HeightAboveFloor, Radius, FloorContact ]
                              │
                              ▼
          [ 2. Dynamic Graph CNN (DGCNN) ]
@@ -59,8 +61,41 @@ The following diagram illustrates the complete end-to-end data flow, from raw in
                              │
                              ▼
          ┌──────────────────────────────────────┐
-         │ Flawless, Rigid 3D Bounding Box (8x3)│
+         │ Rigid 3D Bounding Box (8x3)          │
          └──────────────────────────────────────┘
+```
+
+---
+
+## 📈 Held-Out Evaluation
+
+The current `DGCNNBBoxV2` pose-loss checkpoint was evaluated on the deterministic group-disjoint test split: 20 scenes and 160 usable object instances. These results are a reproducible research baseline, not an industry-ready accuracy claim.
+
+| Metric | Result |
+| --- | ---: |
+| Mean / median MCD | 7.95 cm / 7.82 cm |
+| P90 / P95 MCD | 12.43 cm / 13.45 cm |
+| Mean dimension error | 1.88 cm |
+| Mean Z-center error | 1.24 cm |
+| Mean angular error | 66.07 deg |
+| Recall @ 5 cm / 10 cm / 20 cm | 32.5% / 68.8% / 96.3% |
+
+![Held-out test metrics](docs/images/evaluation/test_metrics.png)
+
+The examples below are the three lowest-MCD instances from the held-out split. Blue points are sampled object geometry, gray points are sampled context, green boxes are ground truth, and red boxes are predictions.
+
+<p align="center">
+  <img src="docs/images/evaluation/best_sample_01.png" width="32%" alt="Best held-out sample 1">
+  <img src="docs/images/evaluation/best_sample_02.png" width="32%" alt="Best held-out sample 2">
+  <img src="docs/images/evaluation/best_sample_03.png" width="32%" alt="Best held-out sample 3">
+</p>
+
+Regenerate the tracked gallery after evaluating a new checkpoint:
+
+```bash
+python scripts/test.py \
+    --checkpoint best_model_pose.pth \
+    --readme_gallery_dir docs/images/evaluation
 ```
 
 ---
@@ -97,10 +132,15 @@ source .venv/bin/activate
 
 # Install the project and dependencies in editable mode
 pip install -e .
+
+# Optional: install test tooling
+pip install -e ".[dev]"
 ```
 
 ### Configuration:
 All core hyperparameters, thresholds, and data settings (like `num_points`) are centralized in `src/sereact_3d_bbox/config.py`. The execution scripts automatically pull defaults from this file, allowing you to globally modify parameters in one place.
+
+Local filesystem paths live in `paths.local.json`. This file is ignored by git, so you can put machine-specific dataset/checkpoint/output paths there. `paths.example.json` shows the expected keys. Every script reads `paths.local.json` by default, and you can override it with `--paths_file /path/to/other_paths.json`.
 
 ---
 
@@ -112,37 +152,36 @@ All executable entry-points are located inside the `scripts/` directory.
 Trains the network using Cosine LR scheduling, AMP (Automatic Mixed Precision), and our advanced composite loss.
 ```bash
 python scripts/train.py \
-    --data_root /path/to/dataset \
     --epochs 100 \
     --batch_size 32 \
+    --model_version v2 \
     --save_path best_model.pth
 ```
+If `data_root` and `split_manifest` are set in `paths.local.json`, they do not need to be repeated on the command line. If the split manifest does not exist, training creates one using deterministic group-disjoint scene splits.
 
 ### 2. Evaluation
-Evaluates the model on the held-out test split, plots MCD (Mean Corner Distance) histograms, computes `Recall @ Thresholds`, and renders HTML plots of the worst failure cases.
+Evaluates the model on the held-out test split, plots MCD (Mean Corner Distance) histograms, computes `Recall @ Thresholds`, and renders static PNG plots of the worst failure cases.
 ```bash
 python scripts/test.py \
-    --data_root /path/to/dataset \
-    --checkpoint best_model.pth \
-    --vis_dir test_output
+    --checkpoint best_model.pth
 ```
+This also reads `data_root`, `split_manifest`, and `test_output_dir` from `paths.local.json` when present.
 
 ### 3. Interactive Inference
 Runs inference on a specific sample or entire dataset. Outputs interactive 3D **Plotly HTML** files with Ground Truth and Predictions seamlessly overlaid.
 ```bash
 python scripts/inference.py \
-    --data_root /path/to/dataset \
-    --weights best_model.pth \
-    --out_dir output_visualizations
+    --weights best_model.pth
 ```
+Missing weights now fail loudly. Use `--allow_random_weights` only for smoke tests.
 
 ### 4. ONNX & INT8 Export
 Exports the model to ONNX using Opsets=18 and generates a dynamically quantized INT8 model roughly 4x smaller.
 ```bash
 python scripts/export_onnx.py \
-    --checkpoint best_model.pth \
-    --out_dir onnx_export
+    --checkpoint best_model.pth
 ```
+The ONNX graph returns `center`, `log_dims`, `rot6d`, and decoded relative `corners`.
 *(Once exported to ONNX, you can build TensorRT engines using `trtexec --onnx=onnx_export/dgcnn_bbox.onnx --fp16 --saveEngine=dgcnn_bbox.trt`)*
 
 ---
@@ -156,11 +195,11 @@ python scripts/export_onnx.py \
 
 ### B. DGCNN over Standard PointNet
 * **Problem:** A standard PointNet processes every point independently. It understands the "global silhouette" of an object but cannot distinguish between a flat wall and a sharp corner.
-* **Solution:** We upgraded to a Dynamic Graph CNN (DGCNN). DGCNN explicitly calculates the distance between neighboring points to build a graph. By analyzing (neighbor - center), the network learns structural topology, enabling millimeter-precision bounds around the object's physical edges.
+* **Solution:** We upgraded to a Dynamic Graph CNN (DGCNN). DGCNN explicitly calculates the distance between neighboring points to build a graph. By analyzing (neighbor - center), the network learns structural topology and can distinguish local surfaces from edges.
 
 ### C. Contextual Sampling for "Invisible Z-Height"
 * **Problem (Partial Observability):** A top-down depth camera only sees the top face of an object (e.g., the roof of a birdhouse). The network has no idea where the bottom of the object is, causing massive errors in Z-axis positioning and height.
-* **Solution:** We extract 512 background points (the floor/table) alongside the 512 object points. We feed this `(7, 1024)` tensor into the network, where the 7th channel acts as a binary mask (1 for object, 0 for background). By allowing the network to "see" the floor beneath the object, it mathematically infers the occluded height.
+* **Solution:** We extract background points alongside object points and feed a `(10, 1024)` tensor into the network. The extra channels identify object/background points, estimate height above the floor, expose radial distance from the anchor, and mark likely floor-contact context.
 
 ### D. Structural Rigidity via 6D Pose Regression
 * **Problem:** Standard 3D networks predict 8 independent corners (24 values). Independent jitter causes these points to tangle into non-cuboid, warped diamonds.
@@ -181,21 +220,21 @@ This provides a 50% breakdown threshold, meaning the point cloud survives cleanl
 Because we guarantee structural rigidity inside the network, our composite loss function only needs to optimize the physical placement and scale of the box:
 
 * **Chamfer Distance Loss (Order-Agnostic):** If a perfect box is rotated 180 degrees, it visually looks identical, but the corner indices have swapped. Standard L1 loss heavily penalizes this, causing "mean collapse". Chamfer Distance measures the nearest-neighbor distance between the predicted corner cloud and the ground truth corner cloud, completely ignoring topological ordering.
-* **Hungarian L1 Loss (Fine-Tuning):** We use the Hungarian matching algorithm (`scipy.optimize.linear_sum_assignment`) to dynamically find the optimal bipartite pairing between the predicted corners and GT corners, then apply a Smooth L1 loss to lock them in with millimeter precision.
+* **Cuboid Pose Matching Loss:** We match against valid cuboid symmetries on-device, then supervise corners, axis-specific dimensions, and orientation from the same matched pose.
 * **Anchor Center L1 Loss:** A direct regularization term forcing the predicted Center Offset to match the ground truth geometric median, keeping the bounding box firmly anchored to the point cloud mass.
-* **Dimension & Orthogonality Regularization:** Explicit mathematical penalties prevent dimensional collapse and ensure the 6D output maps to valid SO(3) rotation matrices.
+* **Dimension & Rotation Regularization:** Direct dimension supervision, supervised rotation columns, and a small raw 6D regularizer reduce collapse and unstable rotations.
 
 ---
 
 ## 📈 Evaluation Metrics
 
 **Design Choice: MCD vs. 3D IoU**
-For both training targets and evaluation metrics, this pipeline utilizes Mean Corner Distance (MCD) paired with the Hungarian matching algorithm rather than the traditional 3D Intersection over Union (IoU). Exact 3D IoU computation for arbitrarily rotated boxes is mathematically unstable and typically requires compiling custom C++/CUDA extensions. MCD provides a completely Python-native, differentiable proxy that elegantly and simultaneously captures translation, scaling, and rotational errors.
+For evaluation, this pipeline uses Mean Corner Distance (MCD) with cuboid-symmetry-aware corner matching rather than arbitrary 3D IoU. Exact 3D IoU for arbitrarily rotated boxes is harder to make robust without custom geometry code, while MCD captures translation, scale, and rotation error in meters.
 
 Performance is measured on a held-out test split (10% of the dataset) using strict physical metrics:
-* **MCD (Mean/Median Corner Distance):** The average L2 distance (in meters) between the predicted corners and the ground truth. Current Best: ~4.5 - 5.2 cm.
-* **Recall @ 10cm / 5cm:** The percentage of predictions where the average error is below a specific threshold (e.g., >90% recall at 10cm).
-* **Z-Occlusion Metrics:** Explicit tracking of the Mean Z-Height Error to measure how successfully the contextual sampling overcomes top-down partial observability.
+* **MCD (Mean/Median Corner Distance):** The average L2 distance (in meters) between the predicted corners and the ground truth. Previous weak baseline: ~4.5 - 5.2 cm before group-disjoint split hardening.
+* **Recall @ 10cm / 5cm:** The percentage of predictions where the average error is below a specific physical threshold.
+* **Z, Dimension, Angular, P90/P95 Metrics:** Secondary checks track occlusion, scale, orientation, and tail failures.
 
 ---
 
@@ -219,11 +258,13 @@ This section outlines the iterative engineering process used to solve the 3D Bou
 * **The Approach:** To guarantee structural rigidity, we changed the regression output to exactly 12 parameters: Center (3), Size (3), and a 6D Continuous Rotation Vector (6). Using Gram-Schmidt orthogonalization, this generated a flawless 90-degree cuboid. To solve the Mean Collapse, we swapped L1 Loss for Chamfer Distance, an order-agnostic metric that measures cloud-to-cloud proximity regardless of corner indexing.
 * **The Problem:** While Chamfer Distance solved the symmetry issue, it is "fuzzy." It pulls point clouds together but doesn't explicitly pin specific corners, causing us to lose millimeter-level precision. Additionally, PointNet failed to recognize sharp local geometries (edges vs. flat surfaces).
 
-### Phase 5: DGCNN + Contextual Sampling + Composite Loss (Current)
+### Phase 5: DGCNN + Contextual Sampling + Composite Loss
 * **The Approach:** We upgraded to Dynamic Graph CNN (DGCNN) to learn explicit topologies like flat walls and sharp corners via EdgeConv. We solved the top-down "Invisible Z-Height" occlusion problem via 7-Channel Contextual Sampling (512 object points + 512 background points).
 * **The Loss Function Evolution:** To achieve maximum precision, we engineered a Composite Loss that combines the best of all previous phases (Chamfer for gross alignment, Hungarian L1 for fine pinning, Center L1 for anchoring, and Orthogonality for rigidity).
 
-This iterative journey resulted in our current pipeline, capable of predicting highly precise, mathematically rigid 3D bounding boxes from severely occluded top-down views.
+### Phase 6: Truthful Splits + Shared Preprocessing + DGCNNBBoxV2 (Current)
+* **The Approach:** Centralize preprocessing, use group-disjoint split manifests, expose a mask-provider inference API, and train DGCNNBBoxV2 with direct center/dimension/orientation supervision plus cuboid-symmetry-aware pose loss.
+* **The Goal:** Make accuracy improvements measurable and repeatable before chasing larger architecture changes.
 
 ---
 
@@ -232,23 +273,31 @@ This iterative journey resulted in our current pipeline, capable of predicting h
 ```text
 sereact_3d_bbox/
 ├── pyproject.toml              # Build system and dependencies
+├── paths.example.json          # Template for local paths
+├── paths.local.json            # Your ignored local path file
 ├── README.md                   # Project documentation
 ├── scripts/
 │   ├── train.py                # Main training loop
 │   ├── test.py                 # Evaluation & test metrics
 │   ├── inference.py            # Local inference & HTML plotting
 │   └── export_onnx.py          # Export to FP32 & INT8 ONNX
+├── tests/                      # Synthetic unit and integration tests
 └── src/
     └── sereact_3d_bbox/
         ├── __init__.py
         ├── config.py           # Centralized dataclass configurations and defaults
         ├── data/
         │   ├── __init__.py
-        │   └── dataset.py      # Context dataset & MAD Filtering
+        │   ├── dataset.py      # Dataset wrapper over shared preprocessing
+        │   ├── preprocessing.py # Validation, sampling, MAD, feature construction
+        │   └── splits.py       # Group-disjoint split manifests
+        ├── inference.py        # Prediction dataclasses and MaskProvider API
+        ├── metrics.py          # Cuboid matching, MCD, summaries
+        ├── paths.py            # Loader for paths.local.json
         ├── models/
         │   ├── __init__.py
-        │   ├── dgcnn.py        # EdgeConv & Graph feature components OOM fixed
-        │   └── loss.py         # Chamfer, Hungarian, & Anchor loss modules
+        │   ├── dgcnn.py        # DGCNNBBox and DGCNNBBoxV2
+        │   └── loss.py         # Chamfer, cuboid pose, center/dim/orientation loss
         └── utils/
             └── __init__.py
 ```

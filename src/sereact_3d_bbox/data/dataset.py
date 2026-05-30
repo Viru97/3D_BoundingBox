@@ -1,132 +1,137 @@
-import os
-import glob
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
-import cv2
 import torch
 from torch.utils.data import Dataset
-from sereact_3d_bbox.config import cfg
 
-def mad_filter(pc_pts, rgb_pts, threshold=cfg.data.mad_threshold):
-    if pc_pts.shape[1] < cfg.data.min_points_threshold:
-        return pc_pts, rgb_pts
-    med    = np.median(pc_pts, axis=1, keepdims=True)
-    mad    = np.median(np.abs(pc_pts - med), axis=1, keepdims=True) + 1e-6
-    inlier = np.all(np.abs(pc_pts - med) < threshold * mad, axis=0)
-    if inlier.sum() < cfg.data.min_points_threshold:
-        return pc_pts, rgb_pts
-    return pc_pts[:, inlier], rgb_pts[:, inlier]
+from sereact_3d_bbox.config import cfg
+from sereact_3d_bbox.data.preprocessing import (
+    DataValidationError,
+    load_sample,
+    preprocess_instance,
+)
+
+
+@dataclass(frozen=True)
+class InstanceRecord:
+    folder: Path
+    scene_id: str
+    instance_idx: int
+
 
 class PointCloudInstanceDataset(Dataset):
-    def __init__(self, data_root, num_points=cfg.data.num_points, is_train=True):
+    def __init__(
+        self,
+        data_root: str | Path,
+        num_points: int = cfg.data.num_points,
+        is_train: bool = True,
+        scene_ids: list[str] | set[str] | None = None,
+        seed: int = cfg.train.seed,
+        strict: bool = False,
+    ):
         super().__init__()
+        self.data_root = Path(data_root)
         self.num_points = num_points
-        self.is_train   = is_train
+        self.is_train = is_train
+        self.seed = seed
+        self.strict = strict
+        self.scene_filter = set(scene_ids) if scene_ids is not None else None
+        self.instances: list[InstanceRecord] = []
+        self.skipped: list[str] = []
+        self._scan()
 
-        self.instances = []
-        folders = sorted(f for f in glob.glob(os.path.join(data_root, "*"))
-                         if os.path.isdir(f))
-        print("Scanning dataset for objects...")
+    def _scan(self) -> None:
+        folders = sorted(p for p in self.data_root.glob("*") if p.is_dir())
         for folder in folders:
-            bbox_path = os.path.join(folder, "bbox3d.npy")
-            if os.path.exists(bbox_path):
-                bboxes = np.load(bbox_path, allow_pickle=True)
-                for i in range(len(bboxes) if bboxes.ndim >= 2 else 0):
-                    self.instances.append((folder, i))
-        print(f"Found {len(self.instances)} instances.")
+            scene_id = folder.name
+            if self.scene_filter is not None and scene_id not in self.scene_filter:
+                continue
+            try:
+                sample = load_sample(folder, require_bboxes=True)
+            except DataValidationError as exc:
+                message = str(exc)
+                self.skipped.append(message)
+                if self.strict:
+                    raise
+                continue
+            for instance_idx, mask in enumerate(sample.masks):
+                if not bool(mask.any()):
+                    self.skipped.append(f"{scene_id}: skipped empty mask {instance_idx}")
+                    continue
+                try:
+                    preprocess_instance(
+                        sample,
+                        instance_idx,
+                        num_points=self.num_points,
+                        rng=np.random.default_rng(self.seed + len(self.instances)),
+                        augment=False,
+                        require_target=True,
+                    )
+                except DataValidationError as exc:
+                    self.skipped.append(str(exc))
+                    if self.strict:
+                        raise
+                    continue
+                self.instances.append(InstanceRecord(folder, scene_id, instance_idx))
 
-    def __len__(self):
+        if not self.instances:
+            raise DataValidationError(
+                f"No usable instances found under {self.data_root}. "
+                "Check dataset path, required files, masks, and bbox3d.npy shapes."
+            )
+
+    def __len__(self) -> int:
         return len(self.instances)
 
-    def __getitem__(self, idx):
-        folder, inst_idx = self.instances[idx]
-
-        img    = cv2.imread(os.path.join(folder, "rgb.jpg"))
-        pc     = np.load(os.path.join(folder, "pc.npy"),
-                         allow_pickle=True).astype(np.float32)
-        masks  = np.load(os.path.join(folder, "mask.npy"),
-                         allow_pickle=True)
-        bboxes = np.load(os.path.join(folder, "bbox3d.npy"),
-                         allow_pickle=True).astype(np.float32)
-
-        m              = masks[inst_idx]
-        obj_y, obj_x   = np.where(m)
-        bg_y,  bg_x    = np.where(~m)
-
-        if len(obj_y) == 0:
-            return {"points": torch.zeros(7, self.num_points),
-                    "target": torch.zeros(24)}
-
-        pc_obj  = pc[:, obj_y, obj_x]
-        rgb_obj = img[obj_y, obj_x, ::-1].astype(np.float32).T / 255.0
-        pc_bg   = pc[:, bg_y,  bg_x]
-        rgb_bg  = img[bg_y,  bg_x,  ::-1].astype(np.float32).T / 255.0
-
-        v = pc_obj[2] > 0.01;  pc_obj,  rgb_obj = pc_obj[:, v],  rgb_obj[:, v]
-        v = pc_bg[2]  > 0.01;  pc_bg,   rgb_bg  = pc_bg[:, v],   rgb_bg[:, v]
-
-        pc_obj, rgb_obj = mad_filter(pc_obj, rgb_obj)
-
-        anchor = (np.median(pc_obj, axis=1) if pc_obj.shape[1] > 0
-                  else np.zeros(3, dtype=np.float32))
-
-        n_obj = self.num_points // 2
-        n_bg  = self.num_points - n_obj
-        N_obj, N_bg = pc_obj.shape[1], pc_bg.shape[1]
-
-        if N_obj > 0:
-            c = np.random.choice(N_obj, n_obj, replace=(N_obj < n_obj))
-            pc_obj, rgb_obj = pc_obj[:, c], rgb_obj[:, c]
-        else:
-            pc_obj  = np.zeros((3, n_obj), dtype=np.float32)
-            rgb_obj = np.zeros((3, n_obj), dtype=np.float32)
-
-        if N_bg > 0:
-            c = np.random.choice(N_bg, n_bg, replace=(N_bg < n_bg))
-            pc_bg, rgb_bg = pc_bg[:, c], rgb_bg[:, c]
-        else:
-            pc_bg  = np.zeros((3, n_bg), dtype=np.float32)
-            rgb_bg = np.zeros((3, n_bg), dtype=np.float32)
-
-        pc_comb   = np.concatenate([pc_obj, pc_bg],  axis=1) - anchor[:, None]
-        rgb_comb  = np.concatenate([rgb_obj, rgb_bg], axis=1)
-        mask_comb = np.concatenate([np.ones((1, n_obj), dtype=np.float32),
-                                    np.zeros((1, n_bg),  dtype=np.float32)], axis=1)
-        features       = np.concatenate([pc_comb, rgb_comb, mask_comb], axis=0)
-        target_offsets = bboxes[inst_idx] - anchor[None]
-
-        if self.is_train:
-            theta = np.random.uniform(0, 2 * np.pi)
-            c, s  = np.cos(theta), np.sin(theta)
-            R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
-            features[:3]   = R @ features[:3]
-            target_offsets = (R @ target_offsets.T).T
-
-            for axis in range(2):
-                if np.random.rand() < 0.5:
-                    features[axis]          *= -1
-                    target_offsets[:, axis] *= -1
-
-            scale = np.random.uniform(0.9, 1.1)
-            features[:3]   *= scale
-            target_offsets *= scale
-
-            z = np.random.uniform(-0.02, 0.02)
-            features[2]           += z
-            target_offsets[:, 2]  += z
-
-            if np.random.rand() > 0.5:
-                n_drop = np.random.randint(1, self.num_points // 10)
-                drop   = np.random.choice(self.num_points, n_drop, replace=False)
-                features[:6, drop] = 0.0
-
-            features[:3] += np.random.randn(3, self.num_points).astype(np.float32) * 0.003
-
-            for ci in range(3, 6):
-                features[ci] = np.clip(
-                    np.random.uniform(0.8, 1.2) * features[ci]
-                    + np.random.uniform(-0.05, 0.05), 0.0, 1.0)
-
+    def __getitem__(self, idx: int) -> dict[str, object]:
+        record = self.instances[idx]
+        sample = load_sample(record.folder, require_bboxes=True)
+        rng_seed = None if self.is_train else self.seed + idx
+        rng = np.random.default_rng(rng_seed)
+        result = preprocess_instance(
+            sample,
+            record.instance_idx,
+            num_points=self.num_points,
+            rng=rng,
+            augment=self.is_train,
+            require_target=True,
+        )
+        assert result.target_corners is not None
+        target = result.target_corners.astype(np.float32)
         return {
-            "points": torch.from_numpy(features.astype(np.float32)),          
-            "target": torch.from_numpy(target_offsets.flatten().astype(np.float32)),  
+            "points": torch.from_numpy(result.features),
+            "target": torch.from_numpy(target),
+            "target_center": torch.from_numpy(target.mean(axis=0).astype(np.float32)),
+            "target_dims": torch.from_numpy(_target_dims(target)),
+            "anchor": torch.from_numpy(result.anchor.astype(np.float32)),
+            "scene_id": result.scene_id,
+            "instance_idx": result.instance_idx,
         }
+
+
+def _target_dims(corners: np.ndarray) -> np.ndarray:
+    edges = np.stack(
+        [
+            corners[1] - corners[0],
+            corners[3] - corners[0],
+            corners[4] - corners[0],
+        ],
+        axis=0,
+    )
+    dims = np.linalg.norm(edges, axis=1).astype(np.float32)
+    return np.sort(dims)[::-1].copy()
+
+
+def collate_fn(batch: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "points": torch.stack([item["points"] for item in batch]),
+        "target": torch.stack([item["target"] for item in batch]),
+        "target_center": torch.stack([item["target_center"] for item in batch]),
+        "target_dims": torch.stack([item["target_dims"] for item in batch]),
+        "anchor": torch.stack([item["anchor"] for item in batch]),
+        "scene_id": [item["scene_id"] for item in batch],
+        "instance_idx": torch.tensor([item["instance_idx"] for item in batch], dtype=torch.long),
+    }

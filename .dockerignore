@@ -18,11 +18,13 @@ __pycache__/
 .claude/
 
 # Project specifics & artifacts
+dataset/
 output/
 output_*/
 test_output/
 onnx_export/
 dummy/
+paths.local.json
 *.pth
 best_model_log.csv
 *.onnx

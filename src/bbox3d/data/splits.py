@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from sereact_3d_bbox.config import cfg
+from bbox3d.config import cfg
 
 
 def discover_scene_ids(data_root: str | Path) -> list[str]:

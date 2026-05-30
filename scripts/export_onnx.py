@@ -7,9 +7,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.inference import load_model
-from sereact_3d_bbox.paths import fill_export_path_args, load_paths
+from bbox3d.config import cfg
+from bbox3d.inference import load_model
+from bbox3d.paths import fill_export_path_args, load_paths
 
 
 class OnnxWrapper(nn.Module):

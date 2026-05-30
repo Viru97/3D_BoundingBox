@@ -1,10 +1,10 @@
 import torch
 
-from sereact_3d_bbox.data.splits import create_split_manifest, split_scene_ids
-from sereact_3d_bbox.inference import load_model
-from sereact_3d_bbox.metrics import cuboid_corner_permutations
-from sereact_3d_bbox.models.dgcnn import DGCNNBBoxV2, rotation_6d_to_matrix
-from sereact_3d_bbox.models.loss import BBoxLoss, cuboid_permutation_loss, matched_pose_losses
+from bbox3d.data.splits import create_split_manifest, split_scene_ids
+from bbox3d.inference import load_model
+from bbox3d.metrics import cuboid_corner_permutations
+from bbox3d.models.dgcnn import DGCNNBBoxV2, rotation_6d_to_matrix
+from bbox3d.models.loss import BBoxLoss, cuboid_permutation_loss, matched_pose_losses
 
 from .conftest import make_dataset
 

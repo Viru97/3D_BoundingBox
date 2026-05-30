@@ -23,7 +23,7 @@ class ProjectPaths:
 
 
 def load_paths(paths_file: str | os.PathLike | None = None) -> ProjectPaths:
-    path = Path(paths_file or os.environ.get("SEREACT_PATHS_FILE", DEFAULT_PATHS_FILE))
+    path = Path(paths_file or os.environ.get("BBOX3D_PATHS_FILE", DEFAULT_PATHS_FILE))
     if not path.exists():
         return ProjectPaths()
     with path.open("r", encoding="utf-8") as f:

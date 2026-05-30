@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from sereact_3d_bbox.data.dataset import PointCloudInstanceDataset
-from sereact_3d_bbox.data.preprocessing import DataValidationError, load_sample, preprocess_instance, sample_aligned
+from bbox3d.data.dataset import PointCloudInstanceDataset
+from bbox3d.data.preprocessing import DataValidationError, load_sample, preprocess_instance, sample_aligned
 
 from .conftest import make_sample
 

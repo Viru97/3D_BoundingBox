@@ -1,11 +1,11 @@
 import torch
 from torch.utils.data import DataLoader
 
-from sereact_3d_bbox.data.dataset import PointCloudInstanceDataset, collate_fn
-from sereact_3d_bbox.data.splits import create_split_manifest, split_scene_ids
-from sereact_3d_bbox.inference import NpyMaskProvider, predict_sample
-from sereact_3d_bbox.models.dgcnn import DGCNNBBoxV2
-from sereact_3d_bbox.models.loss import BBoxLoss
+from bbox3d.data.dataset import PointCloudInstanceDataset, collate_fn
+from bbox3d.data.splits import create_split_manifest, split_scene_ids
+from bbox3d.inference import NpyMaskProvider, predict_sample
+from bbox3d.models.dgcnn import DGCNNBBoxV2
+from bbox3d.models.loss import BBoxLoss
 
 from .conftest import make_dataset
 

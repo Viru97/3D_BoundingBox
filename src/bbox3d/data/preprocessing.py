@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from sereact_3d_bbox.config import cfg
+from bbox3d.config import cfg
 
 
 class DataValidationError(ValueError):

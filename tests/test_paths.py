@@ -1,7 +1,7 @@
 import json
 from argparse import Namespace
 
-from sereact_3d_bbox.paths import fill_missing_path_args, load_paths
+from bbox3d.paths import fill_missing_path_args, load_paths
 
 
 def test_paths_file_fills_missing_args(tmp_path):

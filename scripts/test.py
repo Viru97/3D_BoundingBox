@@ -11,13 +11,13 @@ from torch.utils.data import DataLoader
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.data.dataset import PointCloudInstanceDataset, collate_fn
-from sereact_3d_bbox.data.splits import resolve_split_manifest, split_scene_ids
-from sereact_3d_bbox.inference import load_model
-from sereact_3d_bbox.metrics import angular_error_degrees, mean_corner_distance, sorted_box_dimensions, summarize_mcd
-from sereact_3d_bbox.models.loss import BBoxLoss
-from sereact_3d_bbox.paths import fill_missing_path_args, load_paths
+from bbox3d.config import cfg
+from bbox3d.data.dataset import PointCloudInstanceDataset, collate_fn
+from bbox3d.data.splits import resolve_split_manifest, split_scene_ids
+from bbox3d.inference import load_model
+from bbox3d.metrics import angular_error_degrees, mean_corner_distance, sorted_box_dimensions, summarize_mcd
+from bbox3d.models.loss import BBoxLoss
+from bbox3d.paths import fill_missing_path_args, load_paths
 
 
 EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]

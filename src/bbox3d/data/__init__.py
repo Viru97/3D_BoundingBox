@@ -1,5 +1,5 @@
-from sereact_3d_bbox.data.dataset import PointCloudInstanceDataset, collate_fn
-from sereact_3d_bbox.data.preprocessing import (
+from bbox3d.data.dataset import PointCloudInstanceDataset, collate_fn
+from bbox3d.data.preprocessing import (
     DataValidationError,
     PreprocessResult,
     SampleData,
@@ -7,7 +7,7 @@ from sereact_3d_bbox.data.preprocessing import (
     mad_filter,
     preprocess_instance,
 )
-from sereact_3d_bbox.data.splits import create_split_manifest, load_split_manifest, resolve_split_manifest
+from bbox3d.data.splits import create_split_manifest, load_split_manifest, resolve_split_manifest
 
 __all__ = [
     "DataValidationError",

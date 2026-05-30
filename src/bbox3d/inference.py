@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.data.preprocessing import DataValidationError, SampleData, load_sample, preprocess_instance
-from sereact_3d_bbox.models.dgcnn import build_model, rotation_6d_to_matrix
+from bbox3d.config import cfg
+from bbox3d.data.preprocessing import DataValidationError, SampleData, load_sample, preprocess_instance
+from bbox3d.models.dgcnn import build_model, rotation_6d_to_matrix
 
 
 @dataclass(frozen=True)

@@ -5,10 +5,10 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 
-from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.data.preprocessing import load_sample
-from sereact_3d_bbox.inference import NpyMaskProvider, load_model, predict_sample
-from sereact_3d_bbox.paths import fill_missing_path_args, load_paths
+from bbox3d.config import cfg
+from bbox3d.data.preprocessing import load_sample
+from bbox3d.inference import NpyMaskProvider, load_model, predict_sample
+from bbox3d.paths import fill_missing_path_args, load_paths
 
 
 EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]

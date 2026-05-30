@@ -11,13 +11,13 @@ import torch
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.data.dataset import PointCloudInstanceDataset, collate_fn
-from sereact_3d_bbox.data.splits import resolve_split_manifest, split_scene_ids
-from sereact_3d_bbox.metrics import mean_corner_distance
-from sereact_3d_bbox.models.dgcnn import build_model
-from sereact_3d_bbox.models.loss import BBoxLoss
-from sereact_3d_bbox.paths import fill_missing_path_args, load_paths
+from bbox3d.config import cfg
+from bbox3d.data.dataset import PointCloudInstanceDataset, collate_fn
+from bbox3d.data.splits import resolve_split_manifest, split_scene_ids
+from bbox3d.metrics import mean_corner_distance
+from bbox3d.models.dgcnn import build_model
+from bbox3d.models.loss import BBoxLoss
+from bbox3d.paths import fill_missing_path_args, load_paths
 
 
 CHECKPOINT_FORMAT_VERSION = 1

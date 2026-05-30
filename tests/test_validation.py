@@ -1,4 +1,4 @@
-from sereact_3d_bbox.validation import validate_dataset
+from bbox3d.validation import validate_dataset
 
 from .conftest import make_sample
 

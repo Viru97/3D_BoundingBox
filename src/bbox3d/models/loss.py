@@ -4,14 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.metrics import (
+from bbox3d.config import cfg
+from bbox3d.metrics import (
     chamfer_distance,
     cuboid_corner_permutations,
     mean_corner_distance,
     sorted_box_dimensions,
 )
-from sereact_3d_bbox.models.dgcnn import rotation_6d_to_matrix
+from bbox3d.models.dgcnn import rotation_6d_to_matrix
 
 
 def cuboid_permutation_loss(pred: torch.Tensor, target: torch.Tensor, beta: float = 0.03) -> torch.Tensor:

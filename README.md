@@ -1,4 +1,4 @@
-# Sereact 3D Bounding Box Prediction (DGCNNBBox)
+# 3D Bounding Box Prediction (DGCNNBBox)
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
@@ -17,7 +17,7 @@ This project implements a staged, accuracy-focused pipeline for 3D bounding box 
 
 ## 🌟 Key Features
 
-* **Modular Package Architecture:** Cleanly separated package structure (`src/sereact_3d_bbox`) with standalone execution scripts.
+* **Modular Package Architecture:** Cleanly separated package structure (`src/bbox3d`) with standalone execution scripts.
 * **Dataset Preflight:** Validates every scene and mask before a long training run begins.
 * **Shared Preprocessing Contract (10-Channels):** Samples aligned object/background XYZ and RGB, mask identity, height above floor, radial distance, and floor-contact context.
 * **Robust Preprocessing:** Validates sample shapes, rejects bad masks explicitly, and uses Median Absolute Deviation (MAD) filtering for depth bleeding and mask leakage.
@@ -133,12 +133,12 @@ Use `python -m pip install -e ".[dev]"` or `make install-dev` when contributing.
 The included Dockerfile is a non-root CPU reference image for reproducible inference and export. GPU deployment requires an environment compatible with your NVIDIA driver and CUDA runtime.
 
 ```bash
-docker build -t sereact_3d_bbox .
+docker build -t bbox3d .
 docker run --rm \
     -v /path/to/dataset:/data:ro \
     -v "$(pwd)/best_model.pth:/models/best_model.pth:ro" \
     -v "$(pwd)/output_visualizations:/app/output_visualizations" \
-    sereact_3d_bbox \
+    bbox3d \
     python scripts/inference.py \
     --data_root /data \
     --weights /models/best_model.pth
@@ -146,9 +146,9 @@ docker run --rm \
 
 ### Configuration
 
-Core hyperparameters and thresholds live in `src/sereact_3d_bbox/config.py`.
+Core hyperparameters and thresholds live in `src/bbox3d/config.py`.
 
-Local filesystem paths live in `paths.local.json`. This file is ignored by git, so you can put machine-specific dataset/checkpoint/output paths there. `paths.example.json` shows the expected keys. Every script reads `paths.local.json` by default, and you can override it with `--paths_file /path/to/other_paths.json`.
+Local filesystem paths live in `paths.local.json`. This file is ignored by git, so you can put machine-specific dataset/checkpoint/output paths there. `paths.example.json` shows the expected keys. Every script reads `paths.local.json` by default, and you can override it with `--paths_file /path/to/other_paths.json` or the `BBOX3D_PATHS_FILE` environment variable.
 
 Each dataset scene folder must contain:
 
@@ -315,7 +315,7 @@ This section outlines the iterative engineering process used to solve the 3D Bou
 ## 📂 Project Structure
 
 ```text
-sereact_3d_bbox/
+bbox3d/
 ├── .github/workflows/ci.yml   # Lint, test, compile, and package-build CI
 ├── CONTRIBUTING.md            # Contributor workflow
 ├── Makefile                   # Common local tasks
@@ -331,7 +331,7 @@ sereact_3d_bbox/
 │   └── export_onnx.py          # Export to FP32 & INT8 ONNX
 ├── tests/                      # Synthetic unit and integration tests
 └── src/
-    └── sereact_3d_bbox/
+    └── bbox3d/
         ├── __init__.py
         ├── config.py           # Centralized dataclass configurations and defaults
         ├── data/
@@ -352,4 +352,3 @@ sereact_3d_bbox/
 ```
 
 ---
-

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
-from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.data.preprocessing import DataValidationError, load_sample, preprocess_instance
+from bbox3d.config import cfg
+from bbox3d.data.preprocessing import DataValidationError, load_sample, preprocess_instance
 
 
 @dataclass(frozen=True)

@@ -7,8 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.data.preprocessing import (
+from bbox3d.config import cfg
+from bbox3d.data.preprocessing import (
     DataValidationError,
     load_sample,
     preprocess_instance,

@@ -2,9 +2,9 @@ import argparse
 import json
 from pathlib import Path
 
-from sereact_3d_bbox.config import cfg
-from sereact_3d_bbox.paths import fill_missing_path_args, load_paths
-from sereact_3d_bbox.validation import validate_dataset
+from bbox3d.config import cfg
+from bbox3d.paths import fill_missing_path_args, load_paths
+from bbox3d.validation import validate_dataset
 
 
 def main(args):

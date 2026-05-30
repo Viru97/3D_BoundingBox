@@ -353,6 +353,3 @@ sereact_3d_bbox/
 
 ---
 
-## License
-
-No redistribution license has been selected yet. Add an owner-approved `LICENSE` file before publishing this repository for third-party reuse.

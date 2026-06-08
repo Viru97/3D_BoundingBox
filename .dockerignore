@@ -1,0 +1,40 @@
+# Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+*$py.class
+*.so
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.claude/
+
+# Project specifics & artifacts
+dataset/
+output/
+output_*/
+test_output/
+onnx_export/
+dummy/
+paths.local.json
+*.pth
+*.pth.tmp
+*_log.csv
+*.onnx
+*.onnx.data
+build/
+dist/
+
+# Git
+.git/
+.gitignore

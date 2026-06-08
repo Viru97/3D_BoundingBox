@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build metadata
+*.egg-info/
+build/
+dist/
+
+# IDEs
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Local data and generated artifacts
+dataset/
+dummy/
+output/
+output_visualizations/
+output_*/
+test_output/
+onnx_export/
+*.pth
+*.pth.tmp
+*.pt
+*.onnx
+*.onnx.data
+*_log.csv
+paths.local.json
